@@ -6,14 +6,15 @@ import yfinance as yf
 import requests
 import time
 import random
+from typing import List
 
 # ============================================================
-#  Coach Sniper – Scanner S&P 500 (Heikin Ashi, Yahoo Finance)
-#  Version: Ichimoku + RSI50 + Williams %R + Volume Oscillator
+#  Coach Sniper – Scanner S&P 500 (Heikin Ashi optionnel, Yahoo Finance)
+#  Stratégie: Ichimoku + RSI50 + Williams %R + Volume Oscillator
 # ============================================================
 
 st.set_page_config(page_title="Coach Swing – Heikin Ashi Scanner S&P 500", layout="wide")
-st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi)")
+st.title("🧭 Coach Swing – Scanner S&P 500")
 
 # ---------------------------------------------
 # Heikin Ashi conversion
@@ -89,7 +90,8 @@ def get_sp500_constituents():
         try:
             resp = requests.get(WIKI_URL, headers=headers, timeout=20)
             resp.raise_for_status()
-            tables = pd.read_html(resp.text)
+            # IMPORTANT: éviter lxml → flavor="bs4"
+            tables = pd.read_html(resp.text, flavor="bs4")
             df = tables[0].copy()
             df["Symbol_yf"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
             df = df.rename(
@@ -122,7 +124,7 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(0)
+    return rsi.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
     """a croise au-dessus de b sur cette barre."""
@@ -158,10 +160,10 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
     ema_slow = ema(volume, slow)
     with np.errstate(divide="ignore", invalid="ignore"):
         vo = (ema_fast - ema_slow) / ema_slow * 100.0
-    return vo.replace([np.inf, -np.inf], 0).fillna(0)
+    return pd.Series(np.where(np.isfinite(vo), vo, 0.0), index=volume.index).fillna(0)
 
 # ---------------------------------------------
-# Nouvelle stratégie : Ichimoku + RSI50 + %R + VolumeOsc
+# Stratégie : Ichimoku + RSI50 + %R + VolumeOsc
 # ---------------------------------------------
 def swing_signals_strategy(df: pd.DataFrame,
                            mode: str = "Balanced",
@@ -176,7 +178,7 @@ def swing_signals_strategy(df: pd.DataFrame,
                            vo_slow: int = 20):
     """
     Retourne (buy_now, sell_now, last_values_dict) à la dernière barre selon la logique :
-      - Tendance : Ichimoku (above/below cloud + croisement Tenkan/Kijun selon le mode)
+      - Tendance : Ichimoku (above/below cloud + Tenkan/Kijun selon le mode)
       - Filtre RSI : au-dessus/au-dessous de 50 (optionnel)
       - Timing : Williams %R (croix -80 / -20, up/down turning, ou agressif)
       - Volume : Volume Oscillator > 0 (ou assoupli selon le mode)
@@ -222,7 +224,7 @@ def swing_signals_strategy(df: pd.DataFrame,
         rsiBullOK    = (rsi > 50) if use_rsi_filter else pd.Series(True, index=rsi.index)
         rsiBearOK    = (rsi < 50) if use_rsi_filter else pd.Series(True, index=rsi.index)
         wrLongOK     = wr_cross_up_80
-        wrShortOK    = wr_dn_recent  # = cross sous -20 récent
+        wrShortOK    = wr_dn_recent
         voLongOK     = vo > 0
         voShortOK    = vo < 0
 
@@ -236,7 +238,7 @@ def swing_signals_strategy(df: pd.DataFrame,
         voLongOK     = vo >= -2
         voShortOK    = vo <= 2
 
-    else:  # Balanced (par défaut)
+    else:  # Balanced
         longTrendOK  = (c > kijun) & (aboveCloud | (spanA > spanB))
         shortTrendOK = (c < kijun) & (belowCloud | (spanA < spanB))
         rsiBullOK    = (rsi > 48) if use_rsi_filter else pd.Series(True, index=rsi.index)
@@ -265,13 +267,13 @@ def swing_signals_strategy(df: pd.DataFrame,
     return buy_now, sell_now, last
 
 # ---------------------------------------------
-# Yahoo Finance data loader
+# Yahoo Finance data loader (NE convertit PAS en HA ici)
 # ---------------------------------------------
 @st.cache_data(show_spinner=False)
-def download_bars(tickers: list[str], period: str, interval: str) -> dict:
+def download_bars(tickers: List[str], period: str, interval: str) -> dict:
     """
-    Télécharge OHLCV pour plusieurs tickers et convertit en Heikin Ashi.
-    Retourne dict[ticker] -> DataFrame(OHLCV HA).
+    Télécharge OHLCV pour plusieurs tickers (brut). La conversion HA sera appliquée plus tard au besoin.
+    Retourne dict[ticker] -> DataFrame(OHLCV).
     """
     if not tickers:
         return {}
@@ -297,18 +299,17 @@ def download_bars(tickers: list[str], period: str, interval: str) -> dict:
             dft = df[t].dropna(how="all")
             if dft.empty:
                 continue
-            # Standardize column capitalization
             dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
             keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
             dft = dft[keep]
-            out[t] = to_heikin_ashi(dft)
+            out[t] = dft
     else:
         # Single-ticker
         dft = df.dropna(how="all")
         dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
         dft = dft[keep]
-        out[tickers[0]] = to_heikin_ashi(dft)
+        out[tickers[0]] = dft
 
     return out
 
@@ -329,8 +330,13 @@ with c3:
 with c4:
     search = st.text_input("Recherche (ticker/nom)", "").strip().lower()
 
-# Période par défaut selon l'intervalle
-period_map = {"1d": "2y", "1h": "180d", "30m": "60d", "15m": "30d"}
+# Périodes compatibles Yahoo (intraday raccourcies)
+period_map = {
+    "1d":  "2y",
+    "1h":  "90d",
+    "30m": "30d",
+    "15m": "14d",
+}
 period = period_map.get(interval, "2y")
 
 if interval != "1d" and limit > 120:
@@ -342,12 +348,17 @@ mode = st.sidebar.selectbox("Mode", ["Strict", "Balanced", "Aggressive"], index=
 use_rsi_filter = st.sidebar.checkbox("Filtre RSI 50", value=True)
 rsi_len = st.sidebar.number_input("RSI length", min_value=5, max_value=50, value=14, step=1)
 wr_len = st.sidebar.number_input("Williams %R length", min_value=5, max_value=50, value=14, step=1)
-wr_recent_bars = st.sidebar.number_input("Fenêtre %R récente (barres)", min_value=1, max_value=10, value=3, step=1)
+wr_recent_bars = st.sidebar.number_input("Fenêtre %R récente (barres)", min_value=1, max_value=50, value=14, step=1)  # ← tu voulais 14
 vo_fast = st.sidebar.number_input("Volume Osc fast", min_value=2, max_value=50, value=5, step=1)
 vo_slow = st.sidebar.number_input("Volume Osc slow", min_value=5, max_value=200, value=20, step=1)
 len_tenkan = st.sidebar.number_input("Tenkan", min_value=3, max_value=50, value=9, step=1)
 len_kijun = st.sidebar.number_input("Kijun", min_value=10, max_value=100, value=26, step=1)
 len_senkou_b = st.sidebar.number_input("Senkou Span B", min_value=20, max_value=200, value=52, step=1)
+
+# --- Options de calcul / reproduction TV ---
+use_heikin = st.sidebar.checkbox("Calculer en Heikin Ashi", value=True)
+use_last_closed = st.sidebar.checkbox("Utiliser la dernière barre clôturée", value=True,
+                                      help="Reproduit barstate.isconfirmed de TradingView")
 
 # --- Sélection tickers ---
 base = sp_df.copy()
@@ -358,11 +369,9 @@ if search:
         base["Company"].str.lower().str.contains(search)
         | base["Symbol_yf"].str.lower().str.contains(search)
     ]
-
 sel_tickers = base["Symbol_yf"].head(int(limit)).tolist()
-st.caption(
-    f"{len(sel_tickers)} tickers sélectionnés / {len(all_tickers)} au total – Heikin Ashi – Intervalle {interval}, Période {period}"
-)
+
+st.caption(f"{len(sel_tickers)} tickers sélectionnés / {len(all_tickers)} – Intervalle {interval}, Période {period}")
 
 if not sel_tickers:
     st.info("Aucun ticker sélectionné. Ajuste les filtres.")
@@ -371,28 +380,49 @@ if not sel_tickers:
 with st.spinner("Téléchargement des chandelles (Yahoo Finance)…"):
     bars = download_bars(sel_tickers, period=period, interval=interval)
 
+# Debug rapide: combien ont des données
+valid = sum(1 for t in sel_tickers if bars.get(t) is not None and len(bars[t]) > 0)
+st.caption(f"✅ Jeux de données Yahoo valides : {valid}/{len(sel_tickers)}")
+
 # ---------------------------------------------
 # Calcul des signaux (nouvelle stratégie)
 # ---------------------------------------------
 results = []
+min_bars_needed = max(100, int(len_senkou_b) + 30)  # suffisant pour Ichimoku(52) + marge
+
+skipped_empty = 0
+skipped_short = 0
+
 for t in sel_tickers:
-    dft = bars.get(t)
-    if dft is None or len(dft) < max(200, len_senkou_b + 10):
+    dft_raw = bars.get(t)
+    if dft_raw is None or len(dft_raw) == 0:
+        skipped_empty += 1
+        continue
+
+    # Option HA (comme sur TV si tu étais en HA)
+    dft_src = to_heikin_ashi(dft_raw) if use_heikin else dft_raw
+
+    # Évaluer sur la dernière barre clôturée (barstate.isconfirmed)
+    dft_eval = dft_src.iloc[:-1] if use_last_closed and len(dft_src) > 1 else dft_src
+    if len(dft_eval) < min_bars_needed:
+        skipped_short += 1
         continue
 
     buy_now, sell_now, last = swing_signals_strategy(
-        dft,
+        dft_eval,
         mode=mode,
-        len_tenkan=len_tenkan,
-        len_kijun=len_kijun,
-        len_senkou_b=len_senkou_b,
-        rsi_len=rsi_len,
-        use_rsi_filter=use_rsi_filter,
-        wr_len=wr_len,
-        wr_recent_bars=wr_recent_bars,
-        vo_fast=vo_fast,
-        vo_slow=vo_slow,
+        len_tenkan=int(len_tenkan),
+        len_kijun=int(len_kijun),
+        len_senkou_b=int(len_senkou_b),
+        rsi_len=int(rsi_len),
+        use_rsi_filter=bool(use_rsi_filter),
+        wr_len=int(wr_len),
+        wr_recent_bars=int(wr_recent_bars),
+        vo_fast=int(vo_fast),
+        vo_slow=int(vo_slow),
     )
+
+    last_close = float(dft_src["Close"].iloc[-1]) if len(dft_src) else None
 
     results.append(
         {
@@ -401,7 +431,7 @@ for t in sel_tickers:
             "Sector": base.loc[base["Symbol_yf"] == t, "Sector"].values[0] if not base.empty else None,
             "Buy": buy_now,
             "Sell": sell_now,
-            "Close": float(last.get("Close")) if last.get("Close") is not None else None,
+            "Close": last_close,
             "RSI": float(last.get("RSI")) if last.get("RSI") is not None else None,
             "WR": float(last.get("WR")) if last.get("WR") is not None else None,
             "VO": float(last.get("VO")) if last.get("VO") is not None else None,
@@ -410,7 +440,10 @@ for t in sel_tickers:
 
 res_df = pd.DataFrame(results)
 if res_df.empty:
-    st.warning("Aucun résultat (pas assez de données ou filtres trop stricts).")
+    st.warning(
+        f"Aucun résultat. Tickers vides: {skipped_empty}, trop courts (<{min_bars_needed}): {skipped_short}. "
+        "Réduis la période (intraday), augmente la fenêtre, ou change d’intervalle."
+    )
     st.stop()
 
 # ---------------------------------------------
@@ -435,30 +468,19 @@ res_view = res_view.sort_values(by=sort_by, ascending=ascending, na_position="la
 st.dataframe(res_view, use_container_width=True)
 
 csv = res_view.to_csv(index=False).encode("utf-8")
-st.download_button("💾 Télécharger les signaux (CSV)", data=csv, file_name="coach_swing_sp500_ha_signals.csv", mime="text/csv")
+st.download_button("💾 Télécharger les signaux (CSV)", data=csv, file_name="coach_swing_sp500_signals.csv", mime="text/csv")
 
 st.markdown(
     """
-**Important :** Toutes les analyses sont calculées en **Heikin Ashi** (et non en chandeliers classiques).
+**Important :** Par défaut, l’analyse calcule en **Heikin Ashi** (option dans la sidebar)  
+et évalue les conditions sur la **dernière barre clôturée** (comme TradingView, option modifiable).
 
-**Stratégie utilisée : Ichimoku + RSI50 + Williams %R + Volume Oscillator**
+**Stratégie : Ichimoku + RSI50 + Williams %R + Volume Oscillator**
 
-- **Tendance (Ichimoku)**  
-  - *Strict* : Close > nuage et Tenkan > Kijun (inverse pour short)  
-  - *Balanced* : Close > Kijun et (au-dessus du nuage ou SpanA>SpanB)  
-  - *Aggressive* : Close > Kijun (inverse pour short)
+- **Mode Strict** : Close > nuage & Tenkan > Kijun (inverse short), RSI>50/<50, %R croise -80 / -20, VO>0/<0  
+- **Mode Balanced** : Close > Kijun & (au-dessus du nuage ou SpanA>SpanB), RSI>48/<52, %R récent ou retournement, VO ≥ -1 / ≤ 1  
+- **Mode Aggressive** : Close > Kijun (inverse short), RSI>45/<55, %R pente > -60 / < -40, VO ≥ -2 / ≤ 2
 
-- **Filtre RSI (optionnel)** :  
-  - Strict: >50 / <50 ; Balanced: >48 / <52 ; Aggressive: >45 / <55
-
-- **Timing Williams %R** :  
-  - Strict: croisement au-dessus de -80 (ou sous -20 pour short)  
-  - Balanced: croix récente OU retournement (2 barres)  
-  - Aggressive: pente positive au-dessus de -60 (ou négative sous -40)
-
-- **Volume Oscillator (VO)** :  
-  - Strict: VO>0 / VO<0 ; Balanced: ≥-1 / ≤1 ; Aggressive: ≥-2 / ≤2
-
-Tu peux ajuster tous les paramètres dans la **sidebar**.
+Tu peux ajuster **Fenêtre %R** (mets **14** pour ton setup TV), **RSI 14**, **VO 5/20**, **Tenkan/Kijun/SpanB 9/26/52**.
 """
 )
