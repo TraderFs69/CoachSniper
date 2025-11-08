@@ -8,7 +8,7 @@ import time
 import random
 
 # ============================================================
-#  Coach Swing – Scanner S&P 500 (Heikin Ashi, Yahoo Finance)
+#  Coach Sniper – Scanner S&P 500 (Heikin Ashi, Yahoo Finance)
 #  Version: Ichimoku + RSI50 + Williams %R + Volume Oscillator
 # ============================================================
 
