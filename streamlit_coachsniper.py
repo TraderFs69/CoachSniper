@@ -1,4 +1,4 @@
-# streamlit_coachsniper_1d_cached.py
+# streamlit_coachsniper_1d_yahoo_safe.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,13 +7,22 @@ import requests, io, time, random
 from typing import Dict, Tuple, List
 
 # ==============================
-# Réglages fixes (stables)
+# Réglages fixes (Yahoo only)
 # ==============================
-INTERVAL = "1d"   # intervalle figé
-PERIOD   = "2y"   # historique figé
+INTERVAL = "1d"
+PERIOD   = "2y"
 
-st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Cache stable)", layout="wide")
-st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Cache stable)")
+# Micro-chunks & backoff (anti rate-limit)
+CHUNK            = 5        # <= 5 tickers par appel
+BASE_SLEEP       = 3.0      # base du backoff exponentiel (sec)
+MAX_BACKOFF_TRY  = 4        # 4 tentatives par batch / ticker
+PAUSE_BETWEEN_OK = 1.5      # pause même quand OK (sec)
+
+# Taille par vague (pagination UI)
+DEFAULT_WAVE = 20
+
+st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Yahoo Safe)", layout="wide")
+st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Yahoo Safe)")
 
 # -----------------------------
 # Heikin Ashi
@@ -32,7 +41,7 @@ def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -----------------------------
-# S&P500 constituents
+# Constituants S&P500
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_sp500_constituents():
@@ -122,14 +131,13 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
 # Stratégie Ichimoku (3 modes)
 # -----------------------------
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
-    """Renvoie (buy_now, sell_now, last_dict) sur la dernière barre **clôturée**."""
+    """Renvoie (buy_now, sell_now, last_dict) sur la dernière barre clôturée."""
     if df is None or df.empty:
         return False, False, {}
     data = df.iloc[:-1] if len(df) > 1 else df.copy()
     if len(data) < 82:
         return False, False, {}
 
-    o = data["Open"].astype(float)
     h = data["High"].astype(float)
     l = data["Low"].astype(float)
     c = data["Close"].astype(float)
@@ -193,44 +201,94 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     return buy_now, sell_now, last
 
 # -----------------------------
-# APPEL YAHOO UNIQUE (cache stable)
+# Yahoo micro-chunks + backoff
 # -----------------------------
-@st.cache_data(ttl=60*30, show_spinner=False)
-def fetch_yf_block(tickers_tuple: tuple[str, ...]) -> pd.DataFrame:
-    """
-    Un SEUL appel multi-tickers, clés de cache minimales:
-    - tickers triés et immuables (tuple)
-    - period/intervalle figés via constantes
-    """
-    df = yf.download(
-        tickers=list(tickers_tuple),
-        period=PERIOD, interval=INTERVAL,
-        group_by="ticker", auto_adjust=False,
-        progress=False, threads=False  # évite les rafales internes
-    )
-    return df
+def _call_yf(batch: List[str]):
+    try:
+        return yf.download(
+            tickers=batch,
+            period=PERIOD,
+            interval=INTERVAL,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=False,   # évite les rafales internes
+        )
+    except Exception as e:
+        if "Rate limited" in str(e) or "Too Many Requests" in str(e):
+            return None
+        raise
 
-def extract_to_ha_per_ticker(df_block: pd.DataFrame, tickers_tuple: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if hasattr(df_block, "columns") and isinstance(df_block.columns, pd.MultiIndex):
-        names = df_block.columns.get_level_values(0).unique()
-        for t in tickers_tuple:
-            if t not in names:
+def _process_df(df, batch, out_dict):
+    if df is None or df is False:
+        return
+    if isinstance(df.columns, pd.MultiIndex):
+        base = df.columns.get_level_values(0).unique()
+        for t in batch:
+            if t not in base:
                 continue
-            dft = df_block[t].dropna(how="all")
+            dft = df[t].dropna(how="all")
             if dft.empty:
                 continue
             dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
-            out[t] = to_heikin_ashi(dft[keep])
+            keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
+            out_dict[t] = to_heikin_ashi(dft[keep])
     else:
-        # cas mono-ticker (si un seul)
-        t = tickers_tuple[0]
-        dft = df_block.dropna(how="all")
-        if not dft.empty:
-            dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
-            out[t] = to_heikin_ashi(dft[keep])
+        if len(batch) == 1:
+            dft = df.dropna(how="all")
+            if not dft.empty:
+                dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
+                keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
+                out_dict[batch[0]] = to_heikin_ashi(dft[keep])
+
+@st.cache_data(show_spinner=False)
+def download_bars_yahoo_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
+    """
+    Micro-chunks avec backoff exponentiel + retry individuel.
+    ⚠️ Cache par liste de tickers (tuple trié) uniquement.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    base_list = list(tickers)
+
+    # 1) micro-chunks
+    i = 0
+    while i < len(base_list):
+        batch = base_list[i:i+CHUNK]
+        backoff = 0
+        while True:
+            df = _call_yf(batch)
+            if df is not None and (not isinstance(df, bool)) and (not df.empty):
+                _process_df(df, batch, out)
+                break
+            pause = BASE_SLEEP * (2 ** backoff)
+            st.write(f"⏳ Yahoo backoff {pause:.0f}s (batch {i}-{i+len(batch)-1})")
+            time.sleep(pause + random.random())
+            backoff += 1
+            if backoff >= MAX_BACKOFF_TRY:
+                st.warning(f"Batch abandonné (rate limit) : {batch}")
+                break
+        time.sleep(PAUSE_BETWEEN_OK + random.random())
+        i += CHUNK
+
+    # 2) retry individuel sur les manquants
+    missing = [t for t in base_list if t not in out]
+    if missing:
+        st.info(f"🔁 Retry individuel pour {len(missing)} tickers…")
+    for t in missing:
+        backoff = 0
+        while True:
+            df = _call_yf([t])
+            if df is not None and (not isinstance(df, bool)) and (not df.empty):
+                _process_df(df, [t], out)
+                break
+            pause = BASE_SLEEP * (2 ** backoff)
+            time.sleep(pause + random.random())
+            backoff += 1
+            if backoff >= MAX_BACKOFF_TRY:
+                st.error(f"❌ Échec final: {t}")
+                break
+        time.sleep(1.0 + random.random())
+
     return out
 
 # -----------------------------
@@ -239,56 +297,75 @@ def extract_to_ha_per_ticker(df_block: pd.DataFrame, tickers_tuple: tuple[str, .
 with st.spinner("Chargement de la liste S&P 500…"):
     sp_df, all_tickers = get_sp500_constituents()
 
+# Dow 30 (test rapide)
+DOW30 = ["AAPL","MSFT","JPM","UNH","GS","HD","MS","AMGN","CRM","MCD","CAT","HON","TRV","CVX",
+         "PG","V","JNJ","BA","DIS","NKE","WMT","AXP","KO","IBM","MRK","CSCO","INTC","VZ","MMM","WBA"]
+
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     sectors = sorted(sp_df["Sector"].dropna().unique().tolist())
     sector_sel = st.multiselect("Secteurs", sectors, [])
 with c2:
-    limit = st.number_input("Nombre de tickers", min_value=5, max_value=500, value=80, step=5)
+    limit = st.number_input("Nombre max de tickers", min_value=10, max_value=500, value=120, step=10)
 with c3:
     search = st.text_input("Recherche (ticker/nom)", "").strip().lower()
 
-# Sidebar – stratégie
 st.sidebar.header("Stratégie")
 mode = st.sidebar.selectbox("Mode", ["Balanced", "Strict", "Aggressive"], index=0)
 use_rsi50 = st.sidebar.checkbox("Filtre RSI 50", value=True)
 
-st.caption(f"Intervalle: **{INTERVAL}**, Période: **{PERIOD}** — Données converties ensuite en **Heikin Ashi**")
+st.sidebar.header("Vague de scan (pagination)")
+wave = st.sidebar.number_input("Taille de la vague (<= 20 conseillé)", 10, 60, DEFAULT_WAVE, 5)
+offset = st.sidebar.number_input("Offset (départ)", 0, 500, 0, 1)
+use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
+
+st.caption(f"Intervalle: **{INTERVAL}**, Période: **{PERIOD}** — Données converties en **Heikin Ashi**")
 
 # Filtrage tickers
-base = sp_df.copy()
-if sector_sel:
-    base = base[base["Sector"].isin(sector_sel)]
-if search:
-    base = base[
-        base["Company"].str.lower().str.contains(search)
-        | base["Symbol_yf"].str.lower().str.contains(search)
-    ]
+if use_dow:
+    base_list = [t for t in DOW30]
+    base = sp_df[sp_df["Symbol_yf"].isin(base_list)].copy()
+else:
+    base = sp_df.copy()
+    if sector_sel:
+        base = base[base["Sector"].isin(sector_sel)]
+    if search:
+        base = base[
+            base["Company"].str.lower().str.contains(search)
+            | base["Symbol_yf"].str.lower().str.contains(search)
+        ]
+    base_list = base["Symbol_yf"].tolist()
 
-sel = base["Symbol_yf"].head(int(limit)).tolist()
-tickers_tuple = tuple(sorted(set(sel)))  # tri + dédup + tuple (clé de cache stable)
-st.caption(f"{len(tickers_tuple)} tickers sélectionnés / {len(all_tickers)} au total")
+# Limite globale
+base_list = base_list[: int(limit)]
+total = len(base_list)
+st.caption(f"📈 Tickers filtrés: {total}")
 
-# -----------------------------
-# Bouton & session (évite reruns)
-# -----------------------------
-if "scan_df" not in st.session_state:
-    st.session_state.scan_df = None
+# Pagination par vague
+start = int(offset)
+end = min(start + int(wave), total)
+wave_list = base_list[start:end]
+st.info(f"Vague: index {start} → {end-1}  |  {len(wave_list)} tickers (≤ 20 recommandé)")
 
-go = st.button("▶️ Scanner (appel Yahoo unique)", type="primary")
-if go:
-    with st.spinner("Téléchargement Yahoo (appel multi-tickers)…"):
-        st.session_state.scan_df = fetch_yf_block(tickers_tuple)
+# Bouton d'exécution
+go = st.button("▶️ Scanner cette vague (Yahoo only)", type="primary")
+if not go:
+    st.stop()
 
-df_block = st.session_state.scan_df
-if df_block is None:
+# Téléchargement Yahoo (safe)
+tickers_tuple = tuple(sorted(set(wave_list)))  # clé cache stable
+with st.spinner("Téléchargement des chandelles (Yahoo, micro-chunks)…"):
+    bars = download_bars_yahoo_safe(tickers_tuple)
+
+valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
+st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
+if valid == 0:
+    st.error("Aucune donnée renvoyée par Yahoo pour cette vague. Diminue la vague, puis réessaie.")
     st.stop()
 
 # -----------------------------
-# Conversion HA + signaux
+# Calcul des signaux
 # -----------------------------
-bars = extract_to_ha_per_ticker(df_block, tickers_tuple)
-
 results = []
 for t in tickers_tuple:
     dft = bars.get(t)
@@ -309,7 +386,7 @@ for t in tickers_tuple:
 
 res_df = pd.DataFrame(results)
 if res_df.empty:
-    st.warning("Aucun résultat (données insuffisantes ou filtres stricts).")
+    st.warning("Aucun résultat dans cette vague (filtres stricts ou données manquantes).")
     st.stop()
 
 # -----------------------------
@@ -334,11 +411,12 @@ res_view = res_view.sort_values(by=sort_by, ascending=ascending, na_position="la
 st.dataframe(res_view, use_container_width=True)
 
 csv = res_view.to_csv(index=False).encode("utf-8")
-st.download_button("💾 Télécharger (CSV)", data=csv, file_name="coach_swing_sp500_ha_1d_cached.csv", mime="text/csv")
+st.download_button("💾 Télécharger (CSV)", data=csv,
+                   file_name=f"coach_swing_yahoo_1d_wave_{start}_{end-1}.csv", mime="text/csv")
 
 st.markdown("""
-**Notes “anti-blocage” :**
-- Un **seul** appel Yahoo par scan (multi-tickers) + **cache** sur la **liste triée** des tickers.
-- Changer les réglages de stratégie **n’entraîne pas** de re-téléchargement : on réutilise `scan_df`.
-- Si Yahoo devient grincheux, réduis **Nombre de tickers** (ex. 60) puis **re-clique Scanner**.
+**Conseils anti rate-limit (Yahoo only) :**
+- Garde la **vague ≤ 20** (ex. 20, puis offset +20, etc.).
+- Laisse **quelques dizaines de secondes** entre 2 vagues consécutives si des “Failed downloads” apparaissent.
+- Les micro-chunks (5) + backoff exponentiel sont intégrés ; les tickers manquants sont réessayés **un par un**.
 """)
