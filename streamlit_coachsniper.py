@@ -1,27 +1,22 @@
-# streamlit_coachsniper_1d.py
+# streamlit_coachsniper_1d_cached.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import requests, time, random, io
-from typing import List, Dict, Tuple
+import requests, io, time, random
+from typing import Dict, Tuple, List
 
 # ==============================
-#  Réglages généraux
+# Réglages fixes (stables)
 # ==============================
-INTERVAL = "1d"  # 1D fixe
-PERIOD   = "2y"  # historique par défaut
+INTERVAL = "1d"   # intervalle figé
+PERIOD   = "2y"   # historique figé
 
-# Anti-throttle Yahoo
-CHUNK_SIZE    = 35    # nb de tickers par appel yfinance (multi)
-CHUNK_PAUSE   = 2.0   # pause (sec) entre 2 chunks
-RETRY_ON_FAIL = True  # refait 1 passe sur les tickers échoués
-
-st.set_page_config(page_title="Coach Sniper – S&P500 (Heikin Ashi, 1D)", layout="wide")
-st.title("🧭 Coach Sniper – Scanner S&P 500 (Heikin Ashi, 1D fixe)")
+st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Cache stable)", layout="wide")
+st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Cache stable)")
 
 # -----------------------------
-# Heikin Ashi conversion
+# Heikin Ashi
 # -----------------------------
 def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -32,33 +27,32 @@ def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
         ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
     ha_high = pd.concat([df["High"], ha_open, ha_close], axis=1).max(axis=1)
     ha_low  = pd.concat([df["Low"],  ha_open, ha_close], axis=1).min(axis=1)
-
     out = df.copy()
     out["Open"], out["High"], out["Low"], out["Close"] = ha_open, ha_high, ha_low, ha_close
     return out
 
 # -----------------------------
-# Constituants S&P500
+# S&P500 constituents
 # -----------------------------
-@st.cache_data(show_spinner=False, ttl=60*60)
+@st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_sp500_constituents():
     csv_url = st.secrets.get("SP500_CSV_URL")
     if csv_url:
         try:
             df = pd.read_csv(csv_url)
             if "Symbol" not in df.columns or "Security" not in df.columns:
-                raise ValueError("Le CSV doit contenir 'Symbol' et 'Security'")
+                raise ValueError("CSV doit contenir 'Symbol' et 'Security'")
             df["Symbol_yf"] = df["Symbol"].astype(str).replace(".", "-", regex=False)
             df = df.rename(columns={
-                "Security":"Company","GICS Sector":"Sector","GICS Sub-Industry":"SubIndustry",
-                "Headquarters Location":"HQ","Date first added":"DateAdded"
+                "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
+                "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
             return df, df["Symbol_yf"].tolist()
         except Exception as e:
             st.warning(f"CSV fallback échec ({e}). On tente Wikipedia…)")
 
-    headers = {"User-Agent":"Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
-               "Accept-Language":"en-US,en;q=0.9"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
+               "Accept-Language": "en-US,en;q=0.9"}
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     last_err = None
     for _ in range(3):
@@ -69,8 +63,8 @@ def get_sp500_constituents():
             df = tables[0].copy()
             df["Symbol_yf"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
             df = df.rename(columns={
-                "Security":"Company","GICS Sector":"Sector","GICS Sub-Industry":"SubIndustry",
-                "Headquarters Location":"HQ","Date first added":"DateAdded"
+                "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
+                "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
             return df, df["Symbol_yf"].tolist()
         except Exception as e:
@@ -128,11 +122,7 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
 # Stratégie Ichimoku (3 modes)
 # -----------------------------
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
-    """
-    Ichimoku + (optionnel) filtre RSI>50 + Williams %R + Volume Oscillator
-    Modes: Strict / Balanced / Aggressive
-    Renvoie (buy_now, sell_now, last_dict) sur la **dernière barre clôturée**.
-    """
+    """Renvoie (buy_now, sell_now, last_dict) sur la dernière barre **clôturée**."""
     if df is None or df.empty:
         return False, False, {}
     data = df.iloc[:-1] if len(df) > 1 else df.copy()
@@ -203,67 +193,44 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     return buy_now, sell_now, last
 
 # -----------------------------
-# Loader Yahoo multi-tickers (chunks, 1D fixe)
+# APPEL YAHOO UNIQUE (cache stable)
 # -----------------------------
-@st.cache_data(show_spinner=False)
-def download_bars_chunked(tickers: Tuple[str, ...]) -> Dict[str, pd.DataFrame]:
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_yf_block(tickers_tuple: tuple[str, ...]) -> pd.DataFrame:
     """
-    Télécharge OHLCV en multi-tickers par paquets (CHUNK_SIZE) avec pause entre paquets.
-    Clef de cache stable: (tickers tuple).
+    Un SEUL appel multi-tickers, clés de cache minimales:
+    - tickers triés et immuables (tuple)
+    - period/intervalle figés via constantes
     """
+    df = yf.download(
+        tickers=list(tickers_tuple),
+        period=PERIOD, interval=INTERVAL,
+        group_by="ticker", auto_adjust=False,
+        progress=False, threads=False  # évite les rafales internes
+    )
+    return df
+
+def extract_to_ha_per_ticker(df_block: pd.DataFrame, tickers_tuple: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return out
-
-    tickers_list = list(tickers)
-    total = len(tickers_list)
-    prog = st.progress(0.0)
-
-    def _process_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
-        df = yf.download(
-            tickers=batch,
-            period=PERIOD,
-            interval=INTERVAL,
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-        if isinstance(df.columns, pd.MultiIndex):
-            base_names = df.columns.get_level_values(0).unique()
-            for t in batch:
-                if t not in base_names:
-                    continue
-                dft = df[t].dropna(how="all")
-                if dft.empty:
-                    continue
-                dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-                keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
-                out_dict[t] = to_heikin_ashi(dft[keep])
-        else:
-            if len(batch) == 1:
-                dft = df.dropna(how="all")
-                if not dft.empty:
-                    dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-                    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
-                    out_dict[batch[0]] = to_heikin_ashi(dft[keep])
-
-    # 1ère passe
-    for i in range(0, total, CHUNK_SIZE):
-        batch = tickers_list[i:i+CHUNK_SIZE]
-        _process_batch(batch, out)
-        prog.progress(min(1.0, (i+len(batch))/max(1,total)))
-        time.sleep(CHUNK_PAUSE)
-
-    # Retry simple (optionnel)
-    if RETRY_ON_FAIL:
-        missing = [t for t in tickers_list if t not in out]
-        if missing:
-            for i in range(0, len(missing), CHUNK_SIZE):
-                batch = missing[i:i+CHUNK_SIZE]
-                _process_batch(batch, out)
-                time.sleep(CHUNK_PAUSE)
-
+    if hasattr(df_block, "columns") and isinstance(df_block.columns, pd.MultiIndex):
+        names = df_block.columns.get_level_values(0).unique()
+        for t in tickers_tuple:
+            if t not in names:
+                continue
+            dft = df_block[t].dropna(how="all")
+            if dft.empty:
+                continue
+            dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
+            out[t] = to_heikin_ashi(dft[keep])
+    else:
+        # cas mono-ticker (si un seul)
+        t = tickers_tuple[0]
+        dft = df_block.dropna(how="all")
+        if not dft.empty:
+            dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in dft.columns]
+            out[t] = to_heikin_ashi(dft[keep])
     return out
 
 # -----------------------------
@@ -286,8 +253,7 @@ st.sidebar.header("Stratégie")
 mode = st.sidebar.selectbox("Mode", ["Balanced", "Strict", "Aggressive"], index=0)
 use_rsi50 = st.sidebar.checkbox("Filtre RSI 50", value=True)
 
-# Info en-tête (fixe 1D/2y)
-st.caption(f"Intervalle: **{INTERVAL}**, Période: **{PERIOD}** — Données converties en **Heikin Ashi**")
+st.caption(f"Intervalle: **{INTERVAL}**, Période: **{PERIOD}** — Données converties ensuite en **Heikin Ashi**")
 
 # Filtrage tickers
 base = sp_df.copy()
@@ -298,32 +264,33 @@ if search:
         base["Company"].str.lower().str.contains(search)
         | base["Symbol_yf"].str.lower().str.contains(search)
     ]
-sel_tickers = base["Symbol_yf"].head(int(limit)).tolist()
-st.caption(f"{len(sel_tickers)} tickers sélectionnés / {len(all_tickers)} au total")
 
-if not sel_tickers:
-    st.info("Aucun ticker sélectionné. Ajuste les filtres.")
-    st.stop()
+sel = base["Symbol_yf"].head(int(limit)).tolist()
+tickers_tuple = tuple(sorted(set(sel)))  # tri + dédup + tuple (clé de cache stable)
+st.caption(f"{len(tickers_tuple)} tickers sélectionnés / {len(all_tickers)} au total")
 
-# Bouton pour éviter les reruns multiples
-go = st.button("▶️ Scanner maintenant", type="primary")
-if not go:
-    st.stop()
+# -----------------------------
+# Bouton & session (évite reruns)
+# -----------------------------
+if "scan_df" not in st.session_state:
+    st.session_state.scan_df = None
 
-with st.spinner("Téléchargement des chandelles (Yahoo Finance, 1D)…"):
-    bars = download_bars_chunked(tuple(sel_tickers))
+go = st.button("▶️ Scanner (appel Yahoo unique)", type="primary")
+if go:
+    with st.spinner("Téléchargement Yahoo (appel multi-tickers)…"):
+        st.session_state.scan_df = fetch_yf_block(tickers_tuple)
 
-valid = sum(1 for t in sel_tickers if bars.get(t) is not None and len(bars[t]) > 0)
-st.caption(f"✅ Jeux de données valides : {valid}/{len(sel_tickers)}")
-if valid == 0:
-    st.error("Yahoo n'a renvoyé aucune donnée. Réduis le nombre de tickers, ou réessaie plus tard.")
+df_block = st.session_state.scan_df
+if df_block is None:
     st.stop()
 
 # -----------------------------
-# Calcul des signaux
+# Conversion HA + signaux
 # -----------------------------
+bars = extract_to_ha_per_ticker(df_block, tickers_tuple)
+
 results = []
-for t in sel_tickers:
+for t in tickers_tuple:
     dft = bars.get(t)
     if dft is None or len(dft) < 82:
         continue
@@ -342,7 +309,7 @@ for t in sel_tickers:
 
 res_df = pd.DataFrame(results)
 if res_df.empty:
-    st.warning("Aucun résultat (pas assez de données ou filtres trop stricts).")
+    st.warning("Aucun résultat (données insuffisantes ou filtres stricts).")
     st.stop()
 
 # -----------------------------
@@ -367,15 +334,11 @@ res_view = res_view.sort_values(by=sort_by, ascending=ascending, na_position="la
 st.dataframe(res_view, use_container_width=True)
 
 csv = res_view.to_csv(index=False).encode("utf-8")
-st.download_button("💾 Télécharger les signaux (CSV)", data=csv,
-                   file_name="coach_swing_sp500_ha_1d_signals.csv", mime="text/csv")
+st.download_button("💾 Télécharger (CSV)", data=csv, file_name="coach_swing_sp500_ha_1d_cached.csv", mime="text/csv")
 
 st.markdown("""
-**Important :** Analyse en **Heikin Ashi** (conversion dans le loader).  
-Évaluation sur la **dernière barre clôturée** (robuste vs repaint).
-
-**Stratégie (3 modes)**  
-- **Strict** : au-dessus/au-dessous du nuage **ET** Tenkan/Kijun alignés ; %R récent ; VO > 0 / < 0 ; *(RSI50 si coché)*  
-- **Balanced** (défaut) : c > Kijun et (au-dessus du nuage **ou** SpanA > SpanB) ; %R récent **ou** retournement ; VO ≥ -1 / ≤ 1 ; *(RSI50 si coché)*  
-- **Aggressive** : c au-dessus/en-dessous de Kijun ; %R qui s’améliore/se dégrade ; VO tolérant (±2) ; *(RSI50 si coché)*  
+**Notes “anti-blocage” :**
+- Un **seul** appel Yahoo par scan (multi-tickers) + **cache** sur la **liste triée** des tickers.
+- Changer les réglages de stratégie **n’entraîne pas** de re-téléchargement : on réutilise `scan_df`.
+- Si Yahoo devient grincheux, réduis **Nombre de tickers** (ex. 60) puis **re-clique Scanner**.
 """)
