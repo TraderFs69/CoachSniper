@@ -1,4 +1,3 @@
-# coachsniper.py
 import os, io, time, random, datetime as dt, requests
 from typing import Dict, Tuple, List, Optional
 
@@ -9,12 +8,12 @@ import numpy as np
 # ==============================
 # Réglages (Polygon)
 # ==============================
-INTERVAL = "1d"    # logique de titres & signaux = daily
-YEARS    = 2       # 2 ans d'historique
-ADJUSTED = True    # ajusté (splits/div)
-LIMIT    = 50000   # large pour couvrir toute la plage
+INTERVAL = "1d"
+YEARS    = 2        # années d'historique
+ADJUSTED = True     # données ajustées (splits/dividendes)
+LIMIT    = 50000    # nombre max de chandelles Polygon
 
-# Micro-chunks & backoff (réseau)
+# Micro-chunks & backoff réseau
 CHUNK            = 8
 BASE_SLEEP       = 1.2
 MAX_BACKOFF_TRY  = 4
@@ -24,83 +23,96 @@ PAUSE_BETWEEN_OK = 0.6
 DEFAULT_WAVE = 20
 
 # ==============================
-# Setup
+# Setup Streamlit
 # ==============================
-st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)", layout="wide")
+st.set_page_config(
+    page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)",
+    layout="wide"
+)
 st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Polygon)")
 
-# Clé API Polygon (env ou secrets)
+# Clé API Polygon
 POLY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
 if not POLY:
-    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` (POLYGON_API_KEY=...) ou dans `st.secrets`.")
+    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` (local) ou dans `st.secrets` (Streamlit Cloud).")
     st.stop()
+
 
 # ==============================
 # Heikin Ashi
 # ==============================
 def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
+    ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
+
     ha_open = pd.Series(index=df.index, dtype=float)
-    ha_open.iloc[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2
+    ha_open.iloc[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2.0
     for i in range(1, len(df)):
-        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2.0
+
     ha_high = pd.concat([df["High"], ha_open, ha_close], axis=1).max(axis=1)
     ha_low  = pd.concat([df["Low"],  ha_open, ha_close], axis=1).min(axis=1)
+
     out = df.copy()
     out["Open"], out["High"], out["Low"], out["Close"] = ha_open, ha_high, ha_low, ha_close
     return out
 
+
 # ==============================
-# Constituants S&P500
+# Constituants S&P 500 — robuste
 # ==============================
-@st.cache_data(show_spinner=False, ttl=60*60)
-def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
+@st.cache_data(show_spinner=False, ttl=3600)
+def _get_sp500_constituents_pure(csv_url: Optional[str]):
     """
     Renvoie (df, tickers, messages)
       - df: colonnes (Symbol, Company, Sector, SubIndustry, HQ, DateAdded)
-      - tickers: liste des Symbol au format Polygon (conserve les points, ex. BRK.B)
-      - messages: messages à afficher hors cache
+      - tickers: liste des Symbol (utilisés tels quels pour Polygon)
+      - messages: messages d'info/erreur à afficher dans Streamlit (hors cache)
     """
     messages: List[str] = []
 
-    # 0) Fichier local éventuel (plus robuste si tu en ajoutes un plus tard)
+    # 0) CSV LOCAL éventuel (ex: sp500_constituents.csv dans le repo)
     try:
         if os.path.exists("sp500_constituents.csv"):
             df = pd.read_csv("sp500_constituents.csv")
-            if ("Symbol" in df.columns) and ("Company" in df.columns):
+            if "Symbol" in df.columns:
                 df["Symbol"] = df["Symbol"].astype(str)
                 return df, df["Symbol"].tolist(), messages
     except Exception as e:
-        messages.append(f"Lecture sp500_constituents.csv échouée ({e}).")
+        messages.append(f"CSV local erreur: {e}")
 
-    # 1) CSV externe (via URL dans st.secrets, si fourni)
+    # 1) CSV_URL (via st.secrets["SP500_CSV_URL"]) si présent
     if csv_url:
         try:
             df = pd.read_csv(csv_url)
-            if ("Symbol" not in df.columns) or ("Security" not in df.columns):
-                raise ValueError("CSV doit contenir 'Symbol' et 'Security'.")
+            if "Symbol" not in df.columns or "Security" not in df.columns:
+                raise ValueError("CSV_URL sans colonnes 'Symbol' et 'Security'.")
             df = df.rename(columns={
-                "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
-                "Headquarters Location": "HQ", "Date first added": "DateAdded"
+                "Security": "Company",
+                "GICS Sector": "Sector",
+                "GICS Sub-Industry": "SubIndustry",
+                "Headquarters Location": "HQ",
+                "Date first added": "DateAdded",
             })
             df["Symbol"] = df["Symbol"].astype(str)
             return df, df["Symbol"].tolist(), messages
         except Exception as e:
-            messages.append(f"CSV_URL échec ({e}). On tente Wikipedia…")
- # 2) Wikipédia (fallback)
+            messages.append(f"CSV_URL échec: {e}")
+
+    # 2) Wikipédia (fallback)
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     last_err = None
+
     for _ in range(3):
         try:
-            resp = requests.get(url, headers=headers, timeout=20)
+            resp = requests.get(url, headers=headers, timeout=15)
             resp.raise_for_status()
 
-            # On lit toutes les tables et on CHOISIT celle qui a une colonne "Symbol"
+            # On parcourt toutes les tables et on choisit celle qui contient "Symbol"
             tables = pd.read_html(io.StringIO(resp.text), flavor="bs4")
             df = None
             for t in tables:
@@ -109,38 +121,42 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
                     break
 
             if df is None:
-                raise ValueError("Aucun tableau avec colonne 'Symbol' trouvé sur Wikipédia.")
+                raise ValueError("Aucune table contenant la colonne 'Symbol' trouvée sur Wikipédia.")
 
             df = df.rename(columns={
                 "Security": "Company",
                 "GICS Sector": "Sector",
                 "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ",
-                "Date first added": "DateAdded"
+                "Date first added": "DateAdded",
             })
             df["Symbol"] = df["Symbol"].astype(str)
             return df, df["Symbol"].tolist(), messages
 
         except Exception as e:
             last_err = e
-            time.sleep(0.8 + random.random())
-    
-    # 3) Tout a échoué → on ne lève PLUS d'exception dans la fonction cachée
+            time.sleep(1.0 + random.random())
+
+    # 3) Tout a échoué → on ne lève PAS d'exception, on renvoie vide
     messages.append(f"Échec de récupération du S&P 500 (CSV local / CSV_URL / Wikipédia). Dernière erreur: {last_err}")
     empty = pd.DataFrame(columns=["Symbol", "Company", "Sector", "SubIndustry", "HQ", "DateAdded"])
     return empty, [], messages
 
 
-def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
-    """Wrapper non-caché pour afficher les messages de la version pure et stopper proprement si vide."""
+def get_sp500_constituents():
+    """Wrapper non-caché : affiche les messages + stop proprement si vide."""
     csv_url = st.secrets.get("SP500_CSV_URL", None)
     df, tickers, msgs = _get_sp500_constituents_pure(csv_url)
-    for m in msgs:
-        st.warning(m)
+
+    for msg in msgs:
+        st.warning(msg)
+
     if df.empty:
-        st.error("Impossible de récupérer la liste du S&P 500 (toutes les sources ont échoué).")
+        st.error("Impossible de récupérer la liste du S&P 500. Réessaie plus tard ou ajoute un CSV local.")
         st.stop()
+
     return df, tickers
+
 
 # ==============================
 # Indicateurs utilitaires
@@ -148,45 +164,65 @@ def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
+
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     d = close.diff()
-    gain = d.clip(lower=0.0); loss = -d.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    gain = d.clip(lower=0.0)
+    loss = -d.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - 100/(1+rs)).fillna(0)
+    return (100 - 100 / (1 + rs)).fillna(0)
+
 
 def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a > b) & (a.shift(1) <= b.shift(1))
 
+
 def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a < b) & (a.shift(1) >= b.shift(1))
 
+
 def cross_recent(cross: pd.Series, lookback: int = 3) -> pd.Series:
     out = cross.copy().astype(bool).fillna(False)
-    for i in range(1, lookback+1):
+    for i in range(1, lookback + 1):
         out = out | cross.shift(i).fillna(False)
     return out
 
-def ichimoku_components(high: pd.Series, low: pd.Series, len_tenkan=9, len_kijun=26, len_senkou_b=52):
-    tenkan = (high.rolling(len_tenkan).max() + low.rolling(len_tenkan).min())/2.0
-    kijun  = (high.rolling(len_kijun).max()  + low.rolling(len_kijun).min()) /2.0
-    spanA  = (tenkan + kijun)/2.0
-    spanB  = (high.rolling(len_senkou_b).max() + low.rolling(len_senkou_b).min())/2.0
+
+def ichimoku_components(
+    high: pd.Series,
+    low: pd.Series,
+    len_tenkan: int = 9,
+    len_kijun: int = 26,
+    len_senkou_b: int = 52,
+):
+    tenkan = (high.rolling(len_tenkan).max() + low.rolling(len_tenkan).min()) / 2.0
+    kijun = (high.rolling(len_kijun).max() + low.rolling(len_kijun).min()) / 2.0
+    spanA = (tenkan + kijun) / 2.0
+    spanB = (high.rolling(len_senkou_b).max() + low.rolling(len_senkou_b).min()) / 2.0
     return tenkan, kijun, spanA, spanB
+
 
 def williams_r(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
     hh = high.rolling(length).max()
     ll = low.rolling(length).min()
     denom = (hh - ll).replace(0, np.nan)
     wr = -100 * (hh - close) / denom
-    return wr.replace([np.inf, -np.inf], np.nan).fillna(method="bfill").fillna(method="ffill")
+    return (
+        wr.replace([np.inf, -np.inf], np.nan)
+        .fillna(method="bfill")
+        .fillna(method="ffill")
+    )
 
-def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
-    ema_f = ema(volume, fast); ema_s = ema(volume, slow)
+
+def volume_oscillator(volume: pd.Series, fast: int = 5, slow: int = 20) -> pd.Series:
+    ema_f = ema(volume, fast)
+    ema_s = ema(volume, slow)
     with np.errstate(divide="ignore", invalid="ignore"):
         vo = (ema_f - ema_s) / ema_s * 100.0
     return pd.Series(np.where(np.isfinite(vo), vo, 0.0), index=volume.index).fillna(0)
+
 
 # ==============================
 # Stratégie Ichimoku (3 modes)
@@ -195,6 +231,7 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     """Renvoie (buy_now, sell_now, last_dict) sur la dernière barre clôturée."""
     if df is None or df.empty:
         return False, False, {}
+
     data = df.iloc[:-1] if len(df) > 1 else df.copy()
     if len(data) < 82:
         return False, False, {}
@@ -219,37 +256,41 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     wr = williams_r(h, l, c, 14)
     wr_cross_up_80 = crossover(wr, pd.Series(-80.0, index=wr.index))
     wr_cross_dn_20 = crossunder(wr, pd.Series(-20.0, index=wr.index))
-    wr_up_turning  = (wr > -80) & (wr > wr.shift(1)) & (wr.shift(1) > wr.shift(2))
-    wr_dn_turning  = (wr < -20) & (wr < wr.shift(1)) & (wr.shift(1) < wr.shift(2))
-    wr_up_recent   = cross_recent(wr_cross_up_80, 14)
-    wr_dn_recent   = cross_recent(wr_cross_dn_20, 14)
+    wr_up_turning = (wr > -80) & (wr > wr.shift(1)) & (wr.shift(1) > wr.shift(2))
+    wr_dn_turning = (wr < -20) & (wr < wr.shift(1)) & (wr.shift(1) < wr.shift(2))
+    wr_up_recent = cross_recent(wr_cross_up_80, 14)
+    wr_dn_recent = cross_recent(wr_cross_dn_20, 14)
 
     vo = volume_oscillator(v, 5, 20)
 
     if mode == "Strict":
-        longTrendOK  = aboveCloud & bullTK
+        longTrendOK = aboveCloud & bullTK
         shortTrendOK = belowCloud & bearTK
         wrLongOK, wrShortOK = wr_up_recent, wr_dn_recent
         voLongOK, voShortOK = vo > 0, vo < 0
     elif mode == "Aggressive":
-        longTrendOK  = c > kijun
+        longTrendOK = c > kijun
         shortTrendOK = c < kijun
-        wrLongOK     = (wr > -60) & (wr > wr.shift(1))
-        wrShortOK    = (wr < -40) & (wr < wr.shift(1))
+        wrLongOK = (wr > -60) & (wr > wr.shift(1))
+        wrShortOK = (wr < -40) & (wr < wr.shift(1))
         voLongOK, voShortOK = vo >= -2, vo <= 2
     else:  # Balanced
-        longTrendOK  = (c > kijun) & (aboveCloud | (spanA > spanB))
+        longTrendOK = (c > kijun) & (aboveCloud | (spanA > spanB))
         shortTrendOK = (c < kijun) & (belowCloud | (spanA < spanB))
-        wrLongOK     = wr_up_recent | wr_up_turning
-        wrShortOK    = wr_dn_recent | wr_dn_turning
+        wrLongOK = wr_up_recent | wr_up_turning
+        wrShortOK = wr_dn_recent | wr_dn_turning
         voLongOK, voShortOK = vo >= -1, vo <= 1
 
-    buyCond  = longTrendOK  & rsiBullOK & wrLongOK  & voLongOK
+    buyCond = longTrendOK & rsiBullOK & wrLongOK & voLongOK
     sellCond = shortTrendOK & rsiBearOK & wrShortOK & voShortOK
 
-    buy_now, sell_now = bool(buyCond.iloc[-1]), bool(sellCond.iloc[-1])
+    buy_now = bool(buyCond.iloc[-1])
+    sell_now = bool(sellCond.iloc[-1])
 
-    ema9 = ema(c, 9); ema20 = ema(c, 20); ema50 = ema(c, 50); ema200 = ema(c, 200)
+    ema9 = ema(c, 9)
+    ema20 = ema(c, 20)
+    ema50 = ema(c, 50)
+    ema200 = ema(c, 200)
     last = {
         "ema9": float(ema9.iloc[-1]) if len(ema9) else None,
         "ema20": float(ema20.iloc[-1]) if len(ema20) else None,
@@ -261,12 +302,13 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     }
     return buy_now, sell_now, last
 
+
 # ==============================
 # Polygon — téléchargement OHLCV daily
 # ==============================
 def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
     """
-    Récupère 2 ans de chandelles 1D via Polygon:
+    Récupère ~2 ans de chandelles 1D via Polygon:
       GET /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
     """
     end_date = dt.date.today()
@@ -287,15 +329,16 @@ def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
         if not results:
             return None
         df = pd.DataFrame(results)
-        df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume","t":"ts"})
+        df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "t": "ts"})
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
         df = df.set_index("ts").sort_index()
-        keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
         out = df[keep].astype(float)
         out = to_heikin_ashi(out)
         return out
     except Exception:
         return None
+
 
 def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
     for t in batch:
@@ -303,10 +346,11 @@ def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
         if dft is not None and not dft.empty:
             out_dict[t] = dft
 
+
 @st.cache_data(show_spinner=False)
-def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+def download_bars_polygon_safe(tickers: Tuple[str, ...]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
-    Micro-chunks polygon. Aucun logging Streamlit ici.
+    Micro-chunks Polygon. Aucun logging Streamlit ici.
     Renvoie (bars_dict, failed_tickers)
     """
     out: Dict[str, pd.DataFrame] = {}
@@ -315,7 +359,7 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.D
 
     i = 0
     while i < len(base_list):
-        batch = base_list[i:i+CHUNK]
+        batch = base_list[i : i + CHUNK]
         backoff = 0
         while True:
             try:
@@ -325,6 +369,7 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.D
                     failed.extend(missing_batch)
                     break
             except Exception:
+                # On ignore et on refait une tentative après backoff
                 pass
             pause = BASE_SLEEP * (2 ** backoff)
             time.sleep(pause + random.random())
@@ -351,15 +396,19 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.D
 
     return out, failed
 
+
 # ==============================
 # UI – Filtres & contrôles
 # ==============================
 with st.spinner("Chargement de la liste S&P 500…"):
-    sp_df, all_poly_tickers = get_sp500_constituents()  # Symbols format Polygon
+    sp_df, all_poly_tickers = get_sp500_constituents()
 
-# Dow 30 (test rapide)
-DOW30 = ["AAPL","MSFT","JPM","UNH","GS","HD","MS","AMGN","CRM","MCD","CAT","HON","TRV","CVX",
-         "PG","V","JNJ","BA","DIS","NKE","WMT","AXP","KO","IBM","MRK","CSCO","INTC","VZ","MMM","WBA"]
+# Dow 30 (pour tests rapides)
+DOW30 = [
+    "AAPL", "MSFT", "JPM", "UNH", "GS", "HD", "MS", "AMGN", "CRM", "MCD",
+    "CAT", "HON", "TRV", "CVX", "PG", "V", "JNJ", "BA", "DIS", "NKE",
+    "WMT", "AXP", "KO", "IBM", "MRK", "CSCO", "INTC", "VZ", "MMM", "WBA",
+]
 
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
@@ -381,7 +430,7 @@ use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
 
 st.caption(f"Source: Polygon daily ({YEARS} ans) — Données converties en **Heikin Ashi** — adjusted={ADJUSTED}")
 
-# Filtrage tickers
+# Filtrage des tickers
 if use_dow:
     base_list = [t for t in DOW30]
     base = sp_df[sp_df["Symbol"].isin(base_list)].copy()
@@ -405,14 +454,14 @@ st.caption(f"📈 Tickers filtrés: {total}")
 start = int(offset)
 end = min(start + int(wave), total)
 wave_list = base_list[start:end]
-st.info(f"Vague: index {start} → {end-1}  |  {len(wave_list)} tickers (≤ 20 recommandé)")
+st.info(f"Vague: index {start} → {end - 1}  |  {len(wave_list)} tickers (≤ 20 recommandé)")
 
 # Bouton d'exécution
 go = st.button("▶️ Scanner cette vague (Polygon)", type="primary")
 if not go:
     st.stop()
 
-# Téléchargement Polygon (safe)
+# Téléchargement Polygon
 tickers_tuple = tuple(sorted(set(wave_list)))  # clé cache stable
 with st.spinner("Téléchargement des chandelles (Polygon)…"):
     bars, failed = download_bars_polygon_safe(tickers_tuple)
@@ -420,11 +469,15 @@ with st.spinner("Téléchargement des chandelles (Polygon)…"):
 valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
 st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
 if failed:
-    st.warning(f"⚠️ Tickers échoués (après retries): {len(failed)} — ex.: {', '.join(failed[:8])}{'…' if len(failed)>8 else ''}")
+    st.warning(
+        f"⚠️ Tickers échoués (après retries): {len(failed)} — "
+        f"ex.: {', '.join(failed[:8])}{'…' if len(failed) > 8 else ''}"
+    )
 
 if valid == 0:
     st.error("Aucune donnée renvoyée par Polygon pour cette vague.")
     st.stop()
+
 
 # ==============================
 # Calcul des signaux
@@ -432,28 +485,32 @@ if valid == 0:
 def _safe_get(series: pd.Series):
     return float(series.iloc[-1]) if series is not None and len(series) else None
 
+
 results = []
 for t in tickers_tuple:
     dft = bars.get(t)
     if dft is None or len(dft) < 82:
         continue
     buy_now, sell_now, last = coach_swing_signals(dft, mode=mode, use_rsi50=use_rsi50)
-    results.append({
-        "Ticker": t,
-        "Company": base.loc[base["Symbol"] == t, "Company"].values[0] if not base.empty else t,
-        "Sector":  base.loc[base["Symbol"] == t, "Sector"].values[0] if not base.empty else None,
-        "Buy":     buy_now,
-        "Sell":    sell_now,
-        "Close":   _safe_get(dft["Close"]),
-        "RSI":     last.get("RSI"),
-        "WR":      last.get("WR"),
-        "VO":      last.get("VO"),
-    })
+    results.append(
+        {
+            "Ticker": t,
+            "Company": base.loc[base["Symbol"] == t, "Company"].values[0] if not base.empty else t,
+            "Sector": base.loc[base["Symbol"] == t, "Sector"].values[0] if not base.empty else None,
+            "Buy": buy_now,
+            "Sell": sell_now,
+            "Close": _safe_get(dft["Close"]),
+            "RSI": last.get("RSI"),
+            "WR": last.get("WR"),
+            "VO": last.get("VO"),
+        }
+    )
 
 res_df = pd.DataFrame(results)
 if res_df.empty:
     st.warning("Aucun résultat dans cette vague (filtres stricts ou données manquantes).")
     st.stop()
+
 
 # ==============================
 # Affichage & export
@@ -477,12 +534,18 @@ res_view = res_view.sort_values(by=sort_by, ascending=ascending, na_position="la
 st.dataframe(res_view, use_container_width=True)
 
 csv = res_view.to_csv(index=False).encode("utf-8")
-st.download_button("💾 Télécharger (CSV)", data=csv,
-                   file_name=f"coach_swing_polygon_1d_wave_{start}_{end-1}.csv", mime="text/csv")
+st.download_button(
+    "💾 Télécharger (CSV)",
+    data=csv,
+    file_name=f"coach_swing_polygon_1d_wave_{start}_{end-1}.csv",
+    mime="text/csv",
+)
 
-st.markdown("""
+st.markdown(
+    """
 **Notes Polygon :**
-- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` sont **15 min delayed** sur ton plan — suffisant pour du daily.
-- `BRK.B`, `BF.B`, etc. utilisent **le point** chez Polygon (contrairement à Yahoo qui remplace par un tiret).
-- Si un symbole retourne vide, retente plus tard (maintenance/coverage) ou vérifie s'il est toujours dans le S&P 500.
-""")
+- Données quotidiennes via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` (15 minutes de délai sur ton plan).
+- Les symboles comme `BRK.B`, `BF.B` gardent le point chez Polygon (pas besoin de remplacement).
+- Si certains symboles reviennent vides, retente plus tard ou vérifie s'ils sont toujours dans le S&P 500.
+"""
+)
