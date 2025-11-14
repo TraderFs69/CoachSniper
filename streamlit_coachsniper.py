@@ -1,6 +1,6 @@
 # streamlit_coachsniper_1d_polygon.py
 import os, io, time, random, datetime as dt, requests
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +14,7 @@ YEARS    = 2       # 2 ans d'historique
 ADJUSTED = True    # ajusté (splits/div)
 LIMIT    = 50000   # large pour couvrir toute la plage
 
-# Micro-chunks & backoff (anti-glitch réseau)
+# Micro-chunks & backoff (réseau)
 CHUNK            = 8
 BASE_SLEEP       = 1.2
 MAX_BACKOFF_TRY  = 4
@@ -54,28 +54,31 @@ def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 # ==============================
 # Constituants S&P500
 # ==============================
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def get_sp500_constituents():
+@st.cache_data(show_spinner=False, ttl=60*60)
+def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
-    Renvoie (df, tickers_polygon) où:
-      - df a les colonnes: Symbol (WIKI), Company, Sector, SubIndustry, DateAdded, ...
-      - tickers_polygon = liste de Symbol (format Polygon, ex. 'BRK.B' et pas BRK-B)
+    Renvoie (df, tickers, messages)
+      - df: colonnes standardisées (Symbol, Company, Sector, SubIndustry, HQ, DateAdded)
+      - tickers: liste des Symbol au format Polygon (conserve les points, ex. BRK.B)
+      - messages: liste de messages (infos/erreurs) à afficher hors cache
     """
-    csv_url = st.secrets.get("SP500_CSV_URL")
+    messages: List[str] = []
+    # 1) CSV externe (si fourni)
     if csv_url:
         try:
             df = pd.read_csv(csv_url)
-            if "Symbol" not in df.columns or "Security" not in df.columns:
-                raise ValueError("CSV doit contenir 'Symbol' et 'Security'")
-            # Garder Symbol tel quel pour Polygon (BRK.B, BF.B, etc.)
+            if ("Symbol" not in df.columns) or ("Security" not in df.columns):
+                raise ValueError("CSV doit contenir les colonnes 'Symbol' et 'Security'.")
             df = df.rename(columns={
                 "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
-            return df, df["Symbol"].astype(str).tolist()
+            df["Symbol"] = df["Symbol"].astype(str)
+            return df, df["Symbol"].tolist(), messages
         except Exception as e:
-            st.warning(f"CSV fallback échec ({e}). On tente Wikipedia…)")
+            messages.append(f"CSV fallback échec ({e}). On tente Wikipedia…")
 
+    # 2) Wikipédia (fallback)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
         "Accept-Language": "en-US,en;q=0.9"
@@ -92,12 +95,21 @@ def get_sp500_constituents():
                 "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
-            # Polygon utilise le Symbol tel quel (points conservés, pas de remplacement par '-')
-            return df, df["Symbol"].astype(str).tolist()
+            df["Symbol"] = df["Symbol"].astype(str)
+            return df, df["Symbol"].tolist(), messages
         except Exception as e:
             last_err = e
+            # backoff doux
             time.sleep(0.8 + random.random())
     raise RuntimeError(f"Échec de récupération du S&P 500 : {last_err}")
+
+def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
+    """Wrapper non-caché qui affiche les messages de la version pure."""
+    csv_url = st.secrets.get("SP500_CSV_URL", None)
+    df, tickers, msgs = _get_sp500_constituents_pure(csv_url)
+    for m in msgs:
+        st.warning(m)
+    return df, tickers
 
 # ==============================
 # Indicateurs utilitaires
@@ -221,7 +233,7 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
 # ==============================
 # Polygon — téléchargement OHLCV daily
 # ==============================
-def _polygon_aggs_daily(ticker: str) -> pd.DataFrame | None:
+def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
     """
     Récupère 2 ans de chandelles 1D via Polygon:
       GET /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
@@ -244,13 +256,11 @@ def _polygon_aggs_daily(ticker: str) -> pd.DataFrame | None:
         if not results:
             return None
         df = pd.DataFrame(results)
-        # Colonnes Polygon: t(ms), o,h,l,c,v,n (nb de trades), vw (vwap)
         df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume","t":"ts"})
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
         df = df.set_index("ts").sort_index()
         keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
         out = df[keep].astype(float)
-        # Heikin Ashi pour notre logique
         out = to_heikin_ashi(out)
         return out
     except Exception:
@@ -263,12 +273,13 @@ def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
             out_dict[t] = dft
 
 @st.cache_data(show_spinner=False)
-def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
+def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
-    Micro-chunks polygon. On enchaîne les appels par symbole (endpoint par ticker).
-    Backoff en cas de soucis réseau (ton plan est Unlimited API calls).
+    Micro-chunks polygon. Aucun logging Streamlit ici.
+    Renvoie (bars_dict, failed_tickers)
     """
     out: Dict[str, pd.DataFrame] = {}
+    failed: List[str] = []
     base_list = list(tickers)
 
     i = 0
@@ -278,25 +289,24 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFra
         while True:
             try:
                 _process_polygon_batch(batch, out)
-                break
+                # Marquer ceux qui manquent dans ce batch
+                missing_batch = [t for t in batch if t not in out]
+                # Si tout est OK ou backoff max atteint -> sortir
+                if not missing_batch or backoff >= MAX_BACKOFF_TRY:
+                    failed.extend(missing_batch)
+                    break
             except Exception:
-                # Peu probable ici (on try/except déjà dans _polygon_aggs_daily)
                 pass
+            # Backoff doux
             pause = BASE_SLEEP * (2 ** backoff)
-            st.write(f"⏳ Backoff {pause:.0f}s (batch {i}-{i+len(batch)-1})")
             time.sleep(pause + random.random())
             backoff += 1
-            if backoff >= MAX_BACKOFF_TRY:
-                st.warning(f"Batch abandonné : {batch}")
-                break
         time.sleep(PAUSE_BETWEEN_OK + random.random())
         i += CHUNK
 
-    # Retry individuel sur les manquants (si besoin)
-    missing = [t for t in base_list if t not in out]
-    if missing:
-        st.info(f"🔁 Retry individuel pour {len(missing)} tickers…")
-    for t in missing:
+    # Retry individuel sur les manquants (une passe simple)
+    remaining = [t for t in base_list if t not in out and t not in failed]
+    for t in remaining:
         backoff = 0
         while True:
             dft = _polygon_aggs_daily(t)
@@ -307,11 +317,11 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFra
             time.sleep(pause + random.random())
             backoff += 1
             if backoff >= MAX_BACKOFF_TRY:
-                st.error(f"❌ Échec final: {t}")
+                failed.append(t)
                 break
         time.sleep(0.4 + random.random())
 
-    return out
+    return out, failed
 
 # ==============================
 # UI – Filtres & contrôles
@@ -377,10 +387,13 @@ if not go:
 # Téléchargement Polygon (safe)
 tickers_tuple = tuple(sorted(set(wave_list)))  # clé cache stable
 with st.spinner("Téléchargement des chandelles (Polygon)…"):
-    bars = download_bars_polygon_safe(tickers_tuple)
+    bars, failed = download_bars_polygon_safe(tickers_tuple)
 
 valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
 st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
+if failed:
+    st.warning(f"⚠️ Tickers échoués (après retries): {len(failed)} — ex.: {', '.join(failed[:8])}{'…' if len(failed)>8 else ''}")
+
 if valid == 0:
     st.error("Aucune donnée renvoyée par Polygon pour cette vague.")
     st.stop()
@@ -388,7 +401,7 @@ if valid == 0:
 # ==============================
 # Calcul des signaux
 # ==============================
-def _safe_get(col, series):
+def _safe_get(series: pd.Series):
     return float(series.iloc[-1]) if series is not None and len(series) else None
 
 results = []
@@ -403,7 +416,7 @@ for t in tickers_tuple:
         "Sector":  base.loc[base["Symbol"] == t, "Sector"].values[0] if not base.empty else None,
         "Buy":     buy_now,
         "Sell":    sell_now,
-        "Close":   _safe_get("Close", dft["Close"]),
+        "Close":   _safe_get(dft["Close"]),
         "RSI":     last.get("RSI"),
         "WR":      last.get("WR"),
         "VO":      last.get("VO"),
@@ -441,6 +454,7 @@ st.download_button("💾 Télécharger (CSV)", data=csv,
 
 st.markdown("""
 **Notes Polygon :**
-- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` sont **15 min delayed** sur ton plan, ce qui est OK pour du daily.
+- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` sont **15 min delayed** sur ton plan — suffisant pour du daily.
 - `BRK.B`, `BF.B`, etc. utilisent **le point** chez Polygon (contrairement à Yahoo qui remplace par un tiret).
-- Si un symbole retourne vide, vérifie qu’il est bien listé (S&P 500) ou retente plus tard.
+- Si un symbole retourne vide, retente plus tard (maintenance/coverage) ou vérifie s'il est toujours dans le S&P 500.
+""")
