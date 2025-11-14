@@ -63,7 +63,18 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
       - messages: messages à afficher hors cache
     """
     messages: List[str] = []
-    # 1) CSV externe (si fourni)
+
+    # 0) Fichier local éventuel (plus robuste si tu en ajoutes un plus tard)
+    try:
+        if os.path.exists("sp500_constituents.csv"):
+            df = pd.read_csv("sp500_constituents.csv")
+            if ("Symbol" in df.columns) and ("Company" in df.columns):
+                df["Symbol"] = df["Symbol"].astype(str)
+                return df, df["Symbol"].tolist(), messages
+    except Exception as e:
+        messages.append(f"Lecture sp500_constituents.csv échouée ({e}).")
+
+    # 1) CSV externe (via URL dans st.secrets, si fourni)
     if csv_url:
         try:
             df = pd.read_csv(csv_url)
@@ -76,7 +87,7 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
             df["Symbol"] = df["Symbol"].astype(str)
             return df, df["Symbol"].tolist(), messages
         except Exception as e:
-            messages.append(f"CSV fallback échec ({e}). On tente Wikipedia…)")
+            messages.append(f"CSV_URL échec ({e}). On tente Wikipedia…")
 
     # 2) Wikipédia (fallback)
     headers = {
@@ -100,14 +111,22 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
         except Exception as e:
             last_err = e
             time.sleep(0.8 + random.random())
-    raise RuntimeError(f"Échec de récupération du S&P 500 : {last_err}")
+
+    # 3) Tout a échoué → on ne lève PLUS d'exception dans la fonction cachée
+    messages.append(f"Échec de récupération du S&P 500 (CSV local / CSV_URL / Wikipédia). Dernière erreur: {last_err}")
+    empty = pd.DataFrame(columns=["Symbol", "Company", "Sector", "SubIndustry", "HQ", "DateAdded"])
+    return empty, [], messages
+
 
 def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
-    """Wrapper non-caché pour afficher les messages de la version pure."""
+    """Wrapper non-caché pour afficher les messages de la version pure et stopper proprement si vide."""
     csv_url = st.secrets.get("SP500_CSV_URL", None)
     df, tickers, msgs = _get_sp500_constituents_pure(csv_url)
     for m in msgs:
         st.warning(m)
+    if df.empty:
+        st.error("Impossible de récupérer la liste du S&P 500 (toutes les sources ont échoué).")
+        st.stop()
     return df, tickers
 
 # ==============================
