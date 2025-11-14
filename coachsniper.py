@@ -1,4 +1,4 @@
-# streamlit_coachsniper.py
+# coachsniper.py
 import os, io, time, random, datetime as dt, requests
 from typing import Dict, Tuple, List, Optional
 
