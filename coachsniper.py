@@ -88,8 +88,7 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
             return df, df["Symbol"].tolist(), messages
         except Exception as e:
             messages.append(f"CSV_URL échec ({e}). On tente Wikipedia…")
-
-    # 2) Wikipédia (fallback)
+ # 2) Wikipédia (fallback)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
         "Accept-Language": "en-US,en;q=0.9"
@@ -100,18 +99,32 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
         try:
             resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
+
+            # On lit toutes les tables et on CHOISIT celle qui a une colonne "Symbol"
             tables = pd.read_html(io.StringIO(resp.text), flavor="bs4")
-            df = tables[0].copy()
+            df = None
+            for t in tables:
+                if "Symbol" in t.columns:
+                    df = t.copy()
+                    break
+
+            if df is None:
+                raise ValueError("Aucun tableau avec colonne 'Symbol' trouvé sur Wikipédia.")
+
             df = df.rename(columns={
-                "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
-                "Headquarters Location": "HQ", "Date first added": "DateAdded"
+                "Security": "Company",
+                "GICS Sector": "Sector",
+                "GICS Sub-Industry": "SubIndustry",
+                "Headquarters Location": "HQ",
+                "Date first added": "DateAdded"
             })
             df["Symbol"] = df["Symbol"].astype(str)
             return df, df["Symbol"].tolist(), messages
+
         except Exception as e:
             last_err = e
             time.sleep(0.8 + random.random())
-
+    
     # 3) Tout a échoué → on ne lève PLUS d'exception dans la fonction cachée
     messages.append(f"Échec de récupération du S&P 500 (CSV local / CSV_URL / Wikipédia). Dernière erreur: {last_err}")
     empty = pd.DataFrame(columns=["Symbol", "Company", "Sector", "SubIndustry", "HQ", "DateAdded"])
