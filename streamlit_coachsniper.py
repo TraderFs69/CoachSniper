@@ -1,32 +1,43 @@
-# streamlit_coachsniper_1d_yahoo_safe.py
+# streamlit_coachsniper_1d_polygon.py
+import os, io, time, random, datetime as dt, requests
+from typing import Dict, Tuple, List
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import requests, io, time, random
-from typing import Dict, Tuple, List
 
 # ==============================
-# Réglages fixes (Yahoo only)
+# Réglages (Polygon)
 # ==============================
-INTERVAL = "1d"
-PERIOD   = "2y"
+INTERVAL = "1d"    # logique de titres & signaux = daily
+YEARS    = 2       # 2 ans d'historique
+ADJUSTED = True    # ajusté (splits/div)
+LIMIT    = 50000   # large pour couvrir toute la plage
 
-# Micro-chunks & backoff (anti rate-limit)
-CHUNK            = 5        # <= 5 tickers par appel
-BASE_SLEEP       = 3.0      # base du backoff exponentiel (sec)
-MAX_BACKOFF_TRY  = 4        # 4 tentatives par batch / ticker
-PAUSE_BETWEEN_OK = 1.5      # pause même quand OK (sec)
+# Micro-chunks & backoff (anti-glitch réseau)
+CHUNK            = 8
+BASE_SLEEP       = 1.2
+MAX_BACKOFF_TRY  = 4
+PAUSE_BETWEEN_OK = 0.6
 
 # Taille par vague (pagination UI)
 DEFAULT_WAVE = 20
 
-st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Yahoo Safe)", layout="wide")
-st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Yahoo Safe)")
+# ==============================
+# Setup
+# ==============================
+st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)", layout="wide")
+st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Polygon)")
 
-# -----------------------------
+# Clé API Polygon (env ou secrets)
+POLY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
+if not POLY:
+    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` (POLYGON_API_KEY=...) ou dans `st.secrets`.")
+    st.stop()
+
+# ==============================
 # Heikin Ashi
-# -----------------------------
+# ==============================
 def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -40,28 +51,35 @@ def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     out["Open"], out["High"], out["Low"], out["Close"] = ha_open, ha_high, ha_low, ha_close
     return out
 
-# -----------------------------
+# ==============================
 # Constituants S&P500
-# -----------------------------
+# ==============================
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_sp500_constituents():
+    """
+    Renvoie (df, tickers_polygon) où:
+      - df a les colonnes: Symbol (WIKI), Company, Sector, SubIndustry, DateAdded, ...
+      - tickers_polygon = liste de Symbol (format Polygon, ex. 'BRK.B' et pas BRK-B)
+    """
     csv_url = st.secrets.get("SP500_CSV_URL")
     if csv_url:
         try:
             df = pd.read_csv(csv_url)
             if "Symbol" not in df.columns or "Security" not in df.columns:
                 raise ValueError("CSV doit contenir 'Symbol' et 'Security'")
-            df["Symbol_yf"] = df["Symbol"].astype(str).replace(".", "-", regex=False)
+            # Garder Symbol tel quel pour Polygon (BRK.B, BF.B, etc.)
             df = df.rename(columns={
                 "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
-            return df, df["Symbol_yf"].tolist()
+            return df, df["Symbol"].astype(str).tolist()
         except Exception as e:
             st.warning(f"CSV fallback échec ({e}). On tente Wikipedia…)")
 
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
-               "Accept-Language": "en-US,en;q=0.9"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0; +https://streamlit.io)",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     last_err = None
     for _ in range(3):
@@ -70,24 +88,24 @@ def get_sp500_constituents():
             resp.raise_for_status()
             tables = pd.read_html(io.StringIO(resp.text), flavor="bs4")
             df = tables[0].copy()
-            df["Symbol_yf"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
             df = df.rename(columns={
                 "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ", "Date first added": "DateAdded"
             })
-            return df, df["Symbol_yf"].tolist()
+            # Polygon utilise le Symbol tel quel (points conservés, pas de remplacement par '-')
+            return df, df["Symbol"].astype(str).tolist()
         except Exception as e:
             last_err = e
-            time.sleep(1.0 + random.random())
+            time.sleep(0.8 + random.random())
     raise RuntimeError(f"Échec de récupération du S&P 500 : {last_err}")
 
-# -----------------------------
+# ==============================
 # Indicateurs utilitaires
-# -----------------------------
+# ==============================
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
-def rsi_wilder(close: pd.Series, length: int = 12) -> pd.Series:
+def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     d = close.diff()
     gain = d.clip(lower=0.0); loss = -d.clip(upper=0.0)
     avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
@@ -127,9 +145,9 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
         vo = (ema_f - ema_s) / ema_s * 100.0
     return pd.Series(np.where(np.isfinite(vo), vo, 0.0), index=volume.index).fillna(0)
 
-# -----------------------------
+# ==============================
 # Stratégie Ichimoku (3 modes)
-# -----------------------------
+# ==============================
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
     """Renvoie (buy_now, sell_now, last_dict) sur la dernière barre clôturée."""
     if df is None or df.empty:
@@ -200,86 +218,90 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     }
     return buy_now, sell_now, last
 
-# -----------------------------
-# Yahoo micro-chunks + backoff
-# -----------------------------
-def _call_yf(batch: List[str]):
+# ==============================
+# Polygon — téléchargement OHLCV daily
+# ==============================
+def _polygon_aggs_daily(ticker: str) -> pd.DataFrame | None:
+    """
+    Récupère 2 ans de chandelles 1D via Polygon:
+      GET /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+    """
+    end_date = dt.date.today()
+    start_date = end_date - dt.timedelta(days=int(YEARS * 365.25))
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+    params = {
+        "adjusted": "true" if ADJUSTED else "false",
+        "sort": "asc",
+        "limit": LIMIT,
+        "apiKey": POLY,
+    }
     try:
-        return yf.download(
-            tickers=batch,
-            period=PERIOD,
-            interval=INTERVAL,
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=False,   # évite les rafales internes
-        )
-    except Exception as e:
-        if "Rate limited" in str(e) or "Too Many Requests" in str(e):
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code != 200:
             return None
-        raise
+        js = r.json()
+        results = js.get("results", [])
+        if not results:
+            return None
+        df = pd.DataFrame(results)
+        # Colonnes Polygon: t(ms), o,h,l,c,v,n (nb de trades), vw (vwap)
+        df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume","t":"ts"})
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+        df = df.set_index("ts").sort_index()
+        keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+        out = df[keep].astype(float)
+        # Heikin Ashi pour notre logique
+        out = to_heikin_ashi(out)
+        return out
+    except Exception:
+        return None
 
-def _process_df(df, batch, out_dict):
-    if df is None or df is False:
-        return
-    if isinstance(df.columns, pd.MultiIndex):
-        base = df.columns.get_level_values(0).unique()
-        for t in batch:
-            if t not in base:
-                continue
-            dft = df[t].dropna(how="all")
-            if dft.empty:
-                continue
-            dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-            keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
-            out_dict[t] = to_heikin_ashi(dft[keep])
-    else:
-        if len(batch) == 1:
-            dft = df.dropna(how="all")
-            if not dft.empty:
-                dft = dft.rename(columns={c: c.capitalize() for c in dft.columns})
-                keep = [c for c in ["Open","High","Low","Close","Volume"] if c in dft.columns]
-                out_dict[batch[0]] = to_heikin_ashi(dft[keep])
+def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
+    for t in batch:
+        dft = _polygon_aggs_daily(t)
+        if dft is not None and not dft.empty:
+            out_dict[t] = dft
 
 @st.cache_data(show_spinner=False)
-def download_bars_yahoo_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
+def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFrame]:
     """
-    Micro-chunks avec backoff exponentiel + retry individuel.
-    ⚠️ Cache par liste de tickers (tuple trié) uniquement.
+    Micro-chunks polygon. On enchaîne les appels par symbole (endpoint par ticker).
+    Backoff en cas de soucis réseau (ton plan est Unlimited API calls).
     """
     out: Dict[str, pd.DataFrame] = {}
     base_list = list(tickers)
 
-    # 1) micro-chunks
     i = 0
     while i < len(base_list):
         batch = base_list[i:i+CHUNK]
         backoff = 0
         while True:
-            df = _call_yf(batch)
-            if df is not None and (not isinstance(df, bool)) and (not df.empty):
-                _process_df(df, batch, out)
+            try:
+                _process_polygon_batch(batch, out)
                 break
+            except Exception:
+                # Peu probable ici (on try/except déjà dans _polygon_aggs_daily)
+                pass
             pause = BASE_SLEEP * (2 ** backoff)
-            st.write(f"⏳ Yahoo backoff {pause:.0f}s (batch {i}-{i+len(batch)-1})")
+            st.write(f"⏳ Backoff {pause:.0f}s (batch {i}-{i+len(batch)-1})")
             time.sleep(pause + random.random())
             backoff += 1
             if backoff >= MAX_BACKOFF_TRY:
-                st.warning(f"Batch abandonné (rate limit) : {batch}")
+                st.warning(f"Batch abandonné : {batch}")
                 break
         time.sleep(PAUSE_BETWEEN_OK + random.random())
         i += CHUNK
 
-    # 2) retry individuel sur les manquants
+    # Retry individuel sur les manquants (si besoin)
     missing = [t for t in base_list if t not in out]
     if missing:
         st.info(f"🔁 Retry individuel pour {len(missing)} tickers…")
     for t in missing:
         backoff = 0
         while True:
-            df = _call_yf([t])
-            if df is not None and (not isinstance(df, bool)) and (not df.empty):
-                _process_df(df, [t], out)
+            dft = _polygon_aggs_daily(t)
+            if dft is not None and not dft.empty:
+                out[t] = dft
                 break
             pause = BASE_SLEEP * (2 ** backoff)
             time.sleep(pause + random.random())
@@ -287,15 +309,15 @@ def download_bars_yahoo_safe(tickers: tuple[str, ...]) -> Dict[str, pd.DataFrame
             if backoff >= MAX_BACKOFF_TRY:
                 st.error(f"❌ Échec final: {t}")
                 break
-        time.sleep(1.0 + random.random())
+        time.sleep(0.4 + random.random())
 
     return out
 
-# -----------------------------
+# ==============================
 # UI – Filtres & contrôles
-# -----------------------------
+# ==============================
 with st.spinner("Chargement de la liste S&P 500…"):
-    sp_df, all_tickers = get_sp500_constituents()
+    sp_df, all_poly_tickers = get_sp500_constituents()  # Symbols format Polygon
 
 # Dow 30 (test rapide)
 DOW30 = ["AAPL","MSFT","JPM","UNH","GS","HD","MS","AMGN","CRM","MCD","CAT","HON","TRV","CVX",
@@ -315,16 +337,16 @@ mode = st.sidebar.selectbox("Mode", ["Balanced", "Strict", "Aggressive"], index=
 use_rsi50 = st.sidebar.checkbox("Filtre RSI 50", value=True)
 
 st.sidebar.header("Vague de scan (pagination)")
-wave = st.sidebar.number_input("Taille de la vague (<= 20 conseillé)", 10, 60, DEFAULT_WAVE, 5)
+wave = st.sidebar.number_input("Taille de la vague (≤ 20 conseillé)", 10, 60, DEFAULT_WAVE, 5)
 offset = st.sidebar.number_input("Offset (départ)", 0, 500, 0, 1)
 use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
 
-st.caption(f"Intervalle: **{INTERVAL}**, Période: **{PERIOD}** — Données converties en **Heikin Ashi**")
+st.caption(f"Source: Polygon daily ({YEARS} ans) — Données converties en **Heikin Ashi** — adjusted={ADJUSTED}")
 
 # Filtrage tickers
 if use_dow:
     base_list = [t for t in DOW30]
-    base = sp_df[sp_df["Symbol_yf"].isin(base_list)].copy()
+    base = sp_df[sp_df["Symbol"].isin(base_list)].copy()
 else:
     base = sp_df.copy()
     if sector_sel:
@@ -332,9 +354,9 @@ else:
     if search:
         base = base[
             base["Company"].str.lower().str.contains(search)
-            | base["Symbol_yf"].str.lower().str.contains(search)
+            | base["Symbol"].str.lower().str.contains(search)
         ]
-    base_list = base["Symbol_yf"].tolist()
+    base_list = base["Symbol"].tolist()
 
 # Limite globale
 base_list = base_list[: int(limit)]
@@ -348,24 +370,27 @@ wave_list = base_list[start:end]
 st.info(f"Vague: index {start} → {end-1}  |  {len(wave_list)} tickers (≤ 20 recommandé)")
 
 # Bouton d'exécution
-go = st.button("▶️ Scanner cette vague (Yahoo only)", type="primary")
+go = st.button("▶️ Scanner cette vague (Polygon)", type="primary")
 if not go:
     st.stop()
 
-# Téléchargement Yahoo (safe)
+# Téléchargement Polygon (safe)
 tickers_tuple = tuple(sorted(set(wave_list)))  # clé cache stable
-with st.spinner("Téléchargement des chandelles (Yahoo, micro-chunks)…"):
-    bars = download_bars_yahoo_safe(tickers_tuple)
+with st.spinner("Téléchargement des chandelles (Polygon)…"):
+    bars = download_bars_polygon_safe(tickers_tuple)
 
 valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
 st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
 if valid == 0:
-    st.error("Aucune donnée renvoyée par Yahoo pour cette vague. Diminue la vague, puis réessaie.")
+    st.error("Aucune donnée renvoyée par Polygon pour cette vague.")
     st.stop()
 
-# -----------------------------
+# ==============================
 # Calcul des signaux
-# -----------------------------
+# ==============================
+def _safe_get(col, series):
+    return float(series.iloc[-1]) if series is not None and len(series) else None
+
 results = []
 for t in tickers_tuple:
     dft = bars.get(t)
@@ -374,11 +399,11 @@ for t in tickers_tuple:
     buy_now, sell_now, last = coach_swing_signals(dft, mode=mode, use_rsi50=use_rsi50)
     results.append({
         "Ticker": t,
-        "Company": base.loc[base["Symbol_yf"] == t, "Company"].values[0] if not base.empty else t,
-        "Sector":  base.loc[base["Symbol_yf"] == t, "Sector"].values[0] if not base.empty else None,
+        "Company": base.loc[base["Symbol"] == t, "Company"].values[0] if not base.empty else t,
+        "Sector":  base.loc[base["Symbol"] == t, "Sector"].values[0] if not base.empty else None,
         "Buy":     buy_now,
         "Sell":    sell_now,
-        "Close":   float(dft["Close"].iloc[-1]),
+        "Close":   _safe_get("Close", dft["Close"]),
         "RSI":     last.get("RSI"),
         "WR":      last.get("WR"),
         "VO":      last.get("VO"),
@@ -389,9 +414,9 @@ if res_df.empty:
     st.warning("Aucun résultat dans cette vague (filtres stricts ou données manquantes).")
     st.stop()
 
-# -----------------------------
+# ==============================
 # Affichage & export
-# -----------------------------
+# ==============================
 colA, colB, colC = st.columns([1, 1, 2])
 with colA:
     show = st.selectbox("Afficher", ["Tous", "Buy seulement", "Sell seulement"], index=0)
@@ -412,11 +437,10 @@ st.dataframe(res_view, use_container_width=True)
 
 csv = res_view.to_csv(index=False).encode("utf-8")
 st.download_button("💾 Télécharger (CSV)", data=csv,
-                   file_name=f"coach_swing_yahoo_1d_wave_{start}_{end-1}.csv", mime="text/csv")
+                   file_name=f"coach_swing_polygon_1d_wave_{start}_{end-1}.csv", mime="text/csv")
 
 st.markdown("""
-**Conseils anti rate-limit (Yahoo only) :**
-- Garde la **vague ≤ 20** (ex. 20, puis offset +20, etc.).
-- Laisse **quelques dizaines de secondes** entre 2 vagues consécutives si des “Failed downloads” apparaissent.
-- Les micro-chunks (5) + backoff exponentiel sont intégrés ; les tickers manquants sont réessayés **un par un**.
-""")
+**Notes Polygon :**
+- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` sont **15 min delayed** sur ton plan, ce qui est OK pour du daily.
+- `BRK.B`, `BF.B`, etc. utilisent **le point** chez Polygon (contrairement à Yahoo qui remplace par un tiret).
+- Si un symbole retourne vide, vérifie qu’il est bien listé (S&P 500) ou retente plus tard.
