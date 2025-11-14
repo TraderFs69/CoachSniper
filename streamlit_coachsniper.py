@@ -1,4 +1,4 @@
-# streamlit_coachsniper_1d_polygon.py
+# coachsniper.py
 import os, io, time, random, datetime as dt, requests
 from typing import Dict, Tuple, List, Optional
 
@@ -58,9 +58,9 @@ def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
     Renvoie (df, tickers, messages)
-      - df: colonnes standardisées (Symbol, Company, Sector, SubIndustry, HQ, DateAdded)
+      - df: colonnes (Symbol, Company, Sector, SubIndustry, HQ, DateAdded)
       - tickers: liste des Symbol au format Polygon (conserve les points, ex. BRK.B)
-      - messages: liste de messages (infos/erreurs) à afficher hors cache
+      - messages: messages à afficher hors cache
     """
     messages: List[str] = []
     # 1) CSV externe (si fourni)
@@ -68,7 +68,7 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
         try:
             df = pd.read_csv(csv_url)
             if ("Symbol" not in df.columns) or ("Security" not in df.columns):
-                raise ValueError("CSV doit contenir les colonnes 'Symbol' et 'Security'.")
+                raise ValueError("CSV doit contenir 'Symbol' et 'Security'.")
             df = df.rename(columns={
                 "Security": "Company", "GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry",
                 "Headquarters Location": "HQ", "Date first added": "DateAdded"
@@ -76,7 +76,7 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
             df["Symbol"] = df["Symbol"].astype(str)
             return df, df["Symbol"].tolist(), messages
         except Exception as e:
-            messages.append(f"CSV fallback échec ({e}). On tente Wikipedia…")
+            messages.append(f"CSV fallback échec ({e}). On tente Wikipedia…)")
 
     # 2) Wikipédia (fallback)
     headers = {
@@ -99,12 +99,11 @@ def _get_sp500_constituents_pure(csv_url: Optional[str]) -> Tuple[pd.DataFrame, 
             return df, df["Symbol"].tolist(), messages
         except Exception as e:
             last_err = e
-            # backoff doux
             time.sleep(0.8 + random.random())
     raise RuntimeError(f"Échec de récupération du S&P 500 : {last_err}")
 
 def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
-    """Wrapper non-caché qui affiche les messages de la version pure."""
+    """Wrapper non-caché pour afficher les messages de la version pure."""
     csv_url = st.secrets.get("SP500_CSV_URL", None)
     df, tickers, msgs = _get_sp500_constituents_pure(csv_url)
     for m in msgs:
@@ -289,22 +288,19 @@ def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.D
         while True:
             try:
                 _process_polygon_batch(batch, out)
-                # Marquer ceux qui manquent dans ce batch
                 missing_batch = [t for t in batch if t not in out]
-                # Si tout est OK ou backoff max atteint -> sortir
                 if not missing_batch or backoff >= MAX_BACKOFF_TRY:
                     failed.extend(missing_batch)
                     break
             except Exception:
                 pass
-            # Backoff doux
             pause = BASE_SLEEP * (2 ** backoff)
             time.sleep(pause + random.random())
             backoff += 1
         time.sleep(PAUSE_BETWEEN_OK + random.random())
         i += CHUNK
 
-    # Retry individuel sur les manquants (une passe simple)
+    # Retry individuel (une passe)
     remaining = [t for t in base_list if t not in out and t not in failed]
     for t in remaining:
         backoff = 0
