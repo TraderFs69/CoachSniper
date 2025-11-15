@@ -284,7 +284,7 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
 def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
     """
     Récupère 2 ans de chandelles daily via Polygon avec gestion des erreurs.
-    Version PRO : robuste, retries internes, detection throttling.
+    Version PRO + log optionnel des erreurs.
     """
 
     end_date = dt.date.today()
@@ -299,25 +299,29 @@ def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
         "apiKey": POLY,
     }
 
-    retry_delays = [0.4, 0.8, 1.6, 3.2]  # Exponential backoff (PRO)
+    retry_delays = [0.4, 0.8, 1.6, 3.2]
     last_error = None
 
     for delay in retry_delays:
         try:
             r = requests.get(url, params=params, timeout=30)
 
-            # HTTP error (server busy, throttle, etc.)
             if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}"
+                # On stocke l'erreur HTTP exacte
+                try:
+                    js_err = r.json()
+                    msg = js_err.get("error", js_err.get("message", str(js_err)))
+                except Exception:
+                    msg = r.text[:200]
+                last_error = f"HTTP {r.status_code} – {msg}"
                 time.sleep(delay)
                 continue
 
             js = r.json()
             results = js.get("results", [])
 
-            # No results (Polygon glitch or throttling)
             if not results:
-                last_error = "Empty results"
+                last_error = "Empty results (aucune 'results' dans la réponse JSON)"
                 time.sleep(delay)
                 continue
 
@@ -328,15 +332,20 @@ def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
 
             keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
             out = df[keep].astype(float)
-
             out = to_heikin_ashi(out)
             return out
 
         except Exception as e:
-            last_error = str(e)
+            last_error = f"Exception: {e}"
             time.sleep(delay)
 
-    # After all retries → return None
+    # Si tout a échoué, on peut loguer quelque chose dans la sidebar si debug activé
+    try:
+        if 'debug_polygon' in globals() and debug_polygon:
+            st.sidebar.warning(f"Polygon erreur pour {ticker}: {last_error}")
+    except Exception:
+        pass
+
     return None
 
 def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame], retry_group: List[str]):
@@ -424,6 +433,19 @@ with c3:
 st.sidebar.header("Stratégie")
 mode = st.sidebar.selectbox("Mode", ["Balanced", "Strict", "Aggressive"], index=0)
 use_rsi50 = st.sidebar.checkbox("Filtre RSI 50", value=True)
+
+# Debug Polygon (optionnel)
+st.sidebar.header("Debug Polygon")
+debug_polygon = st.sidebar.checkbox("Activer le debug Polygon", value=False)
+test_symbol = st.sidebar.text_input("Ticker test (Polygon)", "AMZN")
+
+if debug_polygon and st.sidebar.button("Tester ce ticker maintenant"):
+    dft_test = _polygon_aggs_daily(test_symbol.upper())
+    if dft_test is None or dft_test.empty:
+        st.sidebar.error(f"❌ Polygon n'a renvoyé AUCUNE donnée pour {test_symbol.upper()}.")
+    else:
+        st.sidebar.success(f"✅ Polygon OK pour {test_symbol.upper()} – {len(dft_test)} barres daily.")
+        st.sidebar.write(dft_test.tail())
 
 st.sidebar.header("Vague de scan (pagination)")
 wave = st.sidebar.number_input("Taille de la vague (≤ 20 conseillé)", 10, 60, DEFAULT_WAVE, 5)
