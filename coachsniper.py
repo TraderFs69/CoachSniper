@@ -29,11 +29,19 @@ DEFAULT_WAVE = 20
 st.set_page_config(page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)", layout="wide")
 st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Polygon)")
 
-# Clé API Polygon (env ou secrets)
-POLY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
+
+# Clé API Polygon : on lit d'abord dans st.secrets (Cloud), puis dans .env (local)
+POLY = st.secrets.get("POLYGON_API_KEY", None)
+
+if POLY is None:
+    POLY = os.getenv("POLYGON_API_KEY")
+
 if not POLY:
-    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` (POLYGON_API_KEY=...) ou dans `st.secrets`.")
+    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` (POLYGON_API_KEY=...) ou dans `Secrets` de Streamlit.")
     st.stop()
+
+# (optionnel) petit debug pour vérifier qu'on lit bien la clé
+st.sidebar.caption(f"Polygon key loaded: {POLY[:4]}***  (len={len(POLY)})")
 
 # ==============================
 # Heikin Ashi
