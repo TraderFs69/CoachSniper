@@ -132,148 +132,32 @@ def _normalize_sp500_df(df_raw: pd.DataFrame) -> pd.DataFrame:
 # ==============================
 # Constituants S&P500 (version simple style "programme qui marche")
 # ==============================
+
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Charge la liste S&P 500 :
-    1) Wikipedia (?action=render) avec User-Agent
-    2) Wikipedia standard
-    3) Fallback Slickcharts
-    4) (optionnel) CSV local si tu en ajoutes un plus tard
+    path = "sp500_constituents.xlsx"
 
-    Renvoie :
-      - df : au moins une colonne 'Symbol', et si possible 'Company', 'Sector'
-      - tickers : liste des symboles au format Polygon (BRK.B, etc.)
-    """
-    import re
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Fichier {path} introuvable. Ajoute-le dans ton repo GitHub (même dossier que coachsniper.py)."
+        )
 
-    # 0) CSV local optionnel (si un jour tu en ajoutes un)
-    FALLBACK_CSV_PATH = None  # ex: "sp500_constituents.csv"
+    df = pd.read_excel(path)
 
-    wiki_urls = [
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies?action=render",
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml",
-        "Referer": "https://en.wikipedia.org/",
-    }
+    if "Symbol" not in df.columns:
+        raise ValueError("Le fichier Excel doit contenir une colonne 'Symbol'.")
 
-    def extract_df_from_tables(tables: list[pd.DataFrame]) -> Optional[pd.DataFrame]:
-        """
-        Cherche une table avec une colonne 'Symbol' (ou équivalent),
-        et construit un df avec Symbol, Company, Sector si dispo.
-        """
-        for df in tables:
-            cols = [str(c).strip() for c in df.columns]
-            # on cherche une colonne qui matche "Symbol"
-            sym_candidates = [
-                c for c in df.columns
-                if re.search(r"\bSymbol\b", str(c), flags=re.I)
-            ]
-            if not sym_candidates:
-                continue
+    if "Company" not in df.columns:
+        df["Company"] = df["Symbol"]
 
-            sym_col = sym_candidates[0]
-            df2 = df.copy()
-            df2["Symbol"] = (
-                df2[sym_col]
-                .astype("string")
-                .str.strip()
-                .dropna()
-            )
+    if "Sector" not in df.columns:
+        df["Sector"] = "Unknown"
 
-            # Company / Security / Name
-            company_col = None
-            for c in df.columns:
-                c_low = str(c).lower()
-                if "security" in c_low or "company" in c_low or "name" in c_low:
-                    company_col = c
-                    break
+    df["Symbol"] = df["Symbol"].astype(str).str.strip()
+    df = df[df["Symbol"] != ""]
 
-            if company_col is not None:
-                df2["Company"] = df2[company_col].astype("string").str.strip()
-            else:
-                df2["Company"] = df2["Symbol"]
-
-            # Sector
-            sector_col = None
-            for c in df.columns:
-                c_low = str(c).lower()
-                if "gics sector" in c_low or c_low == "sector" or "sector" in c_low:
-                    sector_col = c
-                    break
-            if sector_col is not None:
-                df2["Sector"] = df2[sector_col].astype("string").str.strip()
-            else:
-                df2["Sector"] = "Unknown"
-
-            # On garde juste les colonnes utiles
-            return df2[["Symbol", "Company", "Sector"]].dropna(subset=["Symbol"])
-
-        return None
-
-    # 1 & 2) Tentatives Wikipedia
-    for url in wiki_urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=25)
-            r.raise_for_status()
-            tables = pd.read_html(r.text, flavor="lxml")
-            df_w = extract_df_from_tables(tables)
-            if df_w is not None and not df_w.empty:
-                # ⚠️ pour Polygon, on NE remplace PAS les points
-                df_w["Symbol"] = df_w["Symbol"].astype("string").str.strip()
-                df_w = df_w[df_w["Symbol"] != ""]
-                tickers = sorted(set(df_w["Symbol"].tolist()))
-                st.info(f"Liste S&P 500 chargée depuis Wikipedia ({url}).")
-                return df_w, tickers
-        except Exception:
-            continue  # on tente l'URL suivante
-
-    # 3) Fallback Slickcharts
-    try:
-        sc_headers = headers | {"Referer": "https://www.slickcharts.com/sp500"}
-        sc = requests.get("https://www.slickcharts.com/sp500", headers=sc_headers, timeout=20)
-        sc.raise_for_status()
-        tables = pd.read_html(sc.text)
-        df_sc = None
-        for df in tables:
-            if "Symbol" in df.columns:
-                df_sc = df.copy()
-                break
-        if df_sc is not None:
-            df_sc["Symbol"] = df_sc["Symbol"].astype("string").str.strip()
-            df_sc = df_sc[df_sc["Symbol"] != ""]
-            df_sc["Company"] = df_sc["Company"] if "Company" in df_sc.columns else df_sc["Symbol"]
-            df_sc["Sector"] = "Unknown"
-            df_sc = df_sc[["Symbol", "Company", "Sector"]]
-            tickers = sorted(set(df_sc["Symbol"].tolist()))
-            st.info("Liste S&P 500 chargée depuis Slickcharts.")
-            return df_sc, tickers
-    except Exception:
-        pass
-
-    # 4) CSV local facultatif si tu en as un
-    if FALLBACK_CSV_PATH:
-        st.warning("Sources en ligne indisponibles. Utilisation du CSV local.")
-        df = pd.read_csv(FALLBACK_CSV_PATH)
-        if "Symbol" not in df.columns:
-            raise ValueError("Le CSV de fallback doit contenir une colonne 'Symbol'.")
-        df["Symbol"] = df["Symbol"].astype("string").str.strip()
-        df["Company"] = df["Company"] if "Company" in df.columns else df["Symbol"]
-        df["Sector"] = df["Sector"] if "Sector" in df.columns else "Unknown"
-        df = df[["Symbol", "Company", "Sector"]]
-        tickers = sorted(set(df["Symbol"].tolist()))
-        return df, tickers
-
-    # Si tout échoue :
-    raise RuntimeError("Impossible de récupérer la liste S&P 500 depuis Wikipedia/Slickcharts/CSV.")
+    tickers = df["Symbol"].tolist()
+    return df, tickers
 
 # ==============================
 # Indicateurs utilitaires
