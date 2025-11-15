@@ -6,6 +6,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+POLY = st.secrets.get("POLYGON_API_KEY", None)
+if POLY is None:
+    POLY = os.getenv("POLYGON_API_KEY")
+
+if not POLY:
+    st.error("⚠️ POLYGON_API_KEY manquant.")
+    st.stop()
+
+# DEBUG TEMPORAIRE
+st.sidebar.write("Debug POLY repr:", repr(POLY))
+st.sidebar.write("Longueur:", len(POLY))
+
 # ==============================
 # Réglages (Polygon)
 # ==============================
