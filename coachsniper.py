@@ -26,15 +26,7 @@ if POLY is None:
 if not POLY:
     st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` ou dans les Secrets Streamlit.")
     st.stop()
-
-# 🔍 DEBUG TEMPORAIRE: voir ce que l'app lit vraiment
-st.sidebar.write("Debug POLY repr:", repr(POLY))
-st.sidebar.write("Longueur:", len(POLY))
-
-# DEBUG TEMPORAIRE
-st.sidebar.write("Debug POLY repr:", repr(POLY))
-st.sidebar.write("Longueur:", len(POLY))
-
+    
 # ==============================
 # Réglages (Polygon)
 # ==============================
