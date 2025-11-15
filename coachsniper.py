@@ -283,88 +283,122 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
 # ==============================
 def _polygon_aggs_daily(ticker: str) -> Optional[pd.DataFrame]:
     """
-    Récupère 2 ans de chandelles 1D via Polygon:
-      GET /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+    Récupère 2 ans de chandelles daily via Polygon avec gestion des erreurs.
+    Version PRO : robuste, retries internes, detection throttling.
     """
+
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=int(YEARS * 365.25))
+
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+
     params = {
         "adjusted": "true" if ADJUSTED else "false",
         "sort": "asc",
         "limit": LIMIT,
         "apiKey": POLY,
     }
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code != 200:
-            return None
-        js = r.json()
-        results = js.get("results", [])
-        if not results:
-            return None
-        df = pd.DataFrame(results)
-        df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume","t":"ts"})
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
-        df = df.set_index("ts").sort_index()
-        keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-        out = df[keep].astype(float)
-        out = to_heikin_ashi(out)
-        return out
-    except Exception:
-        return None
 
-def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame]):
+    retry_delays = [0.4, 0.8, 1.6, 3.2]  # Exponential backoff (PRO)
+    last_error = None
+
+    for delay in retry_delays:
+        try:
+            r = requests.get(url, params=params, timeout=30)
+
+            # HTTP error (server busy, throttle, etc.)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                time.sleep(delay)
+                continue
+
+            js = r.json()
+            results = js.get("results", [])
+
+            # No results (Polygon glitch or throttling)
+            if not results:
+                last_error = "Empty results"
+                time.sleep(delay)
+                continue
+
+            df = pd.DataFrame(results)
+            df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "t": "ts"})
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+            df = df.set_index("ts").sort_index()
+
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            out = df[keep].astype(float)
+
+            out = to_heikin_ashi(out)
+            return out
+
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(delay)
+
+    # After all retries → return None
+    return None
+
+def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame], retry_group: List[str]):
+    """
+    Tente d'obtenir chaque ticker une fois en batch + place en retry_group si vide.
+    """
     for t in batch:
         dft = _polygon_aggs_daily(t)
         if dft is not None and not dft.empty:
             out_dict[t] = dft
+        else:
+            retry_group.append(t)
+
 
 @st.cache_data(show_spinner=False)
 def download_bars_polygon_safe(tickers: tuple[str, ...]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
-    Micro-chunks polygon. Aucun logging Streamlit ici.
-    Renvoie (bars_dict, failed_tickers)
+    Version PRO du downloader :
+    - Batch processing + retry intelligent
+    - Exponential backoff
+    - Second pass individuelle avec pauses
+    - Minimisation des tickers échoués
     """
     out: Dict[str, pd.DataFrame] = {}
     failed: List[str] = []
+    retry_group: List[str] = []
+
     base_list = list(tickers)
 
+    # --- PASS 1 : batch processing ---
     i = 0
     while i < len(base_list):
         batch = base_list[i:i+CHUNK]
-        backoff = 0
-        while True:
-            try:
-                _process_polygon_batch(batch, out)
-                missing_batch = [t for t in batch if t not in out]
-                if not missing_batch or backoff >= MAX_BACKOFF_TRY:
-                    failed.extend(missing_batch)
-                    break
-            except Exception:
-                pass
-            pause = BASE_SLEEP * (2 ** backoff)
-            time.sleep(pause + random.random())
-            backoff += 1
-        time.sleep(PAUSE_BETWEEN_OK + random.random())
+        _process_polygon_batch(batch, out, retry_group)
+        time.sleep(0.5 + random.random())  # anti-throttle
         i += CHUNK
 
-    # Retry individuel (une passe)
-    remaining = [t for t in base_list if t not in out and t not in failed]
-    for t in remaining:
-        backoff = 0
-        while True:
+    # --- PASS 2 : retry individuel (lent mais robuste) ---
+    if retry_group:
+        second_retry = retry_group.copy()
+        retry_group = []
+
+        for t in second_retry:
             dft = _polygon_aggs_daily(t)
             if dft is not None and not dft.empty:
                 out[t] = dft
-                break
-            pause = BASE_SLEEP * (2 ** backoff)
-            time.sleep(pause + random.random())
-            backoff += 1
-            if backoff >= MAX_BACKOFF_TRY:
+            else:
+                retry_group.append(t)
+            time.sleep(0.7 + random.random())
+
+    # --- PASS 3 : dernier essai (très lent mais efficace) ---
+    if retry_group:
+        final_round = retry_group.copy()
+        retry_group = []
+
+        for t in final_round:
+            time.sleep(1.25 + random.random())
+            dft = _polygon_aggs_daily(t)
+            if dft is not None and not dft.empty:
+                out[t] = dft
+            else:
                 failed.append(t)
-                break
-        time.sleep(0.4 + random.random())
 
     return out, failed
 
