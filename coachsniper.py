@@ -1,4 +1,3 @@
-# coachsniper.py
 import os, io, time, random, datetime as dt, requests
 from typing import Dict, Tuple, List, Optional
 
@@ -6,13 +5,31 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+# ==============================
+# Config Streamlit (doit être le 1er st.*)
+# ==============================
+st.set_page_config(
+    page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)",
+    layout="wide"
+)
+
+st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Polygon)")
+
+# ==============================
+# Clé API Polygon
+# ==============================
+# On lit d'abord dans st.secrets (Cloud), puis dans .env (local)
 POLY = st.secrets.get("POLYGON_API_KEY", None)
 if POLY is None:
     POLY = os.getenv("POLYGON_API_KEY")
 
 if not POLY:
-    st.error("⚠️ POLYGON_API_KEY manquant.")
+    st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` ou dans les Secrets Streamlit.")
     st.stop()
+
+# 🔍 DEBUG TEMPORAIRE: voir ce que l'app lit vraiment
+st.sidebar.write("Debug POLY repr:", repr(POLY))
+st.sidebar.write("Longueur:", len(POLY))
 
 # DEBUG TEMPORAIRE
 st.sidebar.write("Debug POLY repr:", repr(POLY))
