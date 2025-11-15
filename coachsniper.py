@@ -9,10 +9,10 @@ import numpy as np
 # Config Streamlit (doit être le 1er st.*)
 # ==============================
 st.set_page_config(
-    page_title="Coach Swing – S&P500 (Heikin Ashi, 1D • Polygon)",
+    page_title="Coach Sniper – S&P500",
     layout="wide"
 )
-st.title("🧭 Coach Swing – Scanner S&P 500 (Heikin Ashi, 1D • Polygon)")
+st.title("🧭 Coach Sniper – S&P500")
 
 # ==============================
 # Clé API Polygon
