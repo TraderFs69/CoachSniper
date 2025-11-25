@@ -39,7 +39,6 @@ CHUNK            = 8
 BASE_SLEEP       = 1.2
 MAX_BACKOFF_TRY  = 4
 PAUSE_BETWEEN_OK = 0.6
-DEFAULT_WAVE     = 20
 
 # ==============================
 # Heikin Ashi
@@ -134,14 +133,13 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
     return pd.Series(np.where(np.isfinite(vo), vo, 0.0), index=volume.index).fillna(0)
 
 # ==============================
-# Stratégie Ichimoku (travaille en HA, mais sur OHLC réels)
+# Stratégie Ichimoku (HA sur OHLC réels)
 # ==============================
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
     if df is None or df.empty:
         return False, False, {}, False, False
 
-    # On convertit en Heikin Ashi pour la logique,
-    # mais df lui-même contient les vrais OHLC Polygon.
+    # On convertit en Heikin Ashi pour la logique
     data = to_heikin_ashi(df)
 
     if len(data) < 82:
@@ -195,11 +193,9 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     buyCond  = longTrendOK  & rsiBullOK & wrLongOK  & voLongOK
     sellCond = shortTrendOK & rsiBearOK & wrShortOK & voShortOK
 
-    # Signal actuel (aujourd’hui)
     buy_now  = bool(buyCond.iloc[-1])
     sell_now = bool(sellCond.iloc[-1])
 
-    # Nouveau signal : passe de False → True sur la dernière bougie
     if len(buyCond) >= 2:
         buy_new  = bool(buyCond.iloc[-1] and not buyCond.iloc[-2])
         sell_new = bool(sellCond.iloc[-1] and not sellCond.iloc[-2])
@@ -351,12 +347,14 @@ DOW30 = [
     "PG","V","JNJ","BA","DIS","NKE","WMT","AXP","KO","IBM","MRK","CSCO","INTC","VZ","MMM","WBA"
 ]
 
+# Filtres haut de page
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     sectors = sorted(sp_df["Sector"].dropna().unique().tolist()) if "Sector" in sp_df.columns else []
     sector_sel = st.multiselect("Secteurs", sectors, [])
 with c2:
-    limit = st.number_input("Nombre max de tickers", min_value=10, max_value=500, value=120, step=10)
+    st.markdown("**Nombre de tickers scannés**")
+    st.caption("• Secteur sélectionné : tous les titres\n• Tous secteurs : ~500 titres max")
 with c3:
     search = st.text_input("Recherche (ticker/nom)", "").strip().lower()
 
@@ -376,17 +374,18 @@ if debug_polygon and st.sidebar.button("Tester ce ticker maintenant"):
         st.sidebar.success(f"✅ Polygon OK pour {test_symbol.upper()} – {len(dft_test)} barres daily.")
         st.sidebar.write(dft_test.tail())
 
-st.sidebar.header("Vague de scan (pagination)")
-wave = st.sidebar.number_input("Taille de la vague (≤ 20 conseillé)", 10, 60, DEFAULT_WAVE, 5)
-offset = st.sidebar.number_input("Offset (départ)", 0, 500, 0, 1)
+st.sidebar.header("Vague de scan")
 use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
+st.sidebar.caption("• Un secteur : scan complet\n• Tous secteurs : ~500 tickers.")
 
 st.caption(
     f"Source: Polygon daily ({YEARS} ans) — Stratégie en **Heikin Ashi**, "
     f"mais Close affiché = réel Polygon — adjusted={ADJUSTED}"
 )
 
-# Filtrage tickers
+# ==============================
+# Filtrage tickers + logique de taille auto
+# ==============================
 if use_dow:
     base_list = [t for t in DOW30]
     base = sp_df[sp_df["Symbol"].isin(base_list)].copy()
@@ -401,14 +400,26 @@ else:
         base = base[mask]
     base_list = base["Symbol"].tolist()
 
-base_list = base_list[: int(limit)]
-total = len(base_list)
-st.caption(f"📈 Tickers filtrés: {total}")
+total_unclipped = len(base_list)
 
-start = int(offset)
-end = min(start + int(wave), total)
+# 🎯 Logique demandée :
+# - Secteur sélectionné → scan de tous les tickers filtrés
+# - Aucun secteur (tous) → limite à ~500 tickers max
+if sector_sel or use_dow:
+    limit = total_unclipped
+else:
+    limit = min(total_unclipped, 500)
+
+base_list = base_list[:limit]
+total = len(base_list)
+
+st.caption(f"📈 Tickers filtrés: {total} (limite auto = {limit})")
+
+# Une seule vague qui couvre tout ce qu'on a décidé de scanner
+start = 0
+end = total
 wave_list = base_list[start:end]
-st.info(f"Vague: index {start} → {end-1}  |  {len(wave_list)} tickers (≤ 20 recommandé)")
+st.info(f"Vague unique : {len(wave_list)} tickers scannés")
 
 go = st.button("▶️ Scanner cette vague (Polygon)", type="primary")
 if not go:
@@ -448,7 +459,6 @@ for t in tickers_tuple:
     if dft is None or len(dft) < 82:
         continue
 
-    # dft = OHLCV RÉELS ; la stratégie convertit en HA en interne
     buy_now, sell_now, last, buy_new, sell_new = coach_swing_signals(
         dft, mode=mode, use_rsi50=use_rsi50
     )
