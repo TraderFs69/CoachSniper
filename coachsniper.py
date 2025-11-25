@@ -138,14 +138,14 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
 # ==============================
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
     if df is None or df.empty:
-        return False, False, {}
+        return False, False, {}, False, False
 
-    # 🔥 Ici on convertit en Heikin Ashi pour la logique,
+    # On convertit en Heikin Ashi pour la logique,
     # mais df lui-même contient les vrais OHLC Polygon.
     data = to_heikin_ashi(df)
 
     if len(data) < 82:
-        return False, False, {}
+        return False, False, {}, False, False
 
     h = data["High"].astype(float)
     l = data["Low"].astype(float)
@@ -195,7 +195,17 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
     buyCond  = longTrendOK  & rsiBullOK & wrLongOK  & voLongOK
     sellCond = shortTrendOK & rsiBearOK & wrShortOK & voShortOK
 
-    buy_now, sell_now = bool(buyCond.iloc[-1]), bool(sellCond.iloc[-1])
+    # Signal actuel (aujourd’hui)
+    buy_now  = bool(buyCond.iloc[-1])
+    sell_now = bool(sellCond.iloc[-1])
+
+    # Nouveau signal : passe de False → True sur la dernière bougie
+    if len(buyCond) >= 2:
+        buy_new  = bool(buyCond.iloc[-1] and not buyCond.iloc[-2])
+        sell_new = bool(sellCond.iloc[-1] and not sellCond.iloc[-2])
+    else:
+        buy_new = False
+        sell_new = False
 
     ema9  = ema(c, 9)
     ema20 = ema(c, 20)
@@ -211,7 +221,7 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
         "WR":     float(wr.iloc[-1])     if len(wr)     else None,
         "VO":     float(vo.iloc[-1])     if len(vo)     else None,
     }
-    return buy_now, sell_now, last
+    return buy_now, sell_now, last, buy_new, sell_new
 
 # ==============================
 # Polygon – téléchargement OHLCV daily
@@ -263,7 +273,7 @@ def _polygon_aggs_daily(ticker: str, debug: bool = False) -> Optional[pd.DataFra
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
             df = df.set_index("ts").sort_index()
             keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            out = df[keep].astype(float)   # 👈 OHLCV RÉELS
+            out = df[keep].astype(float)   # OHLCV RÉELS
             return out
 
         except Exception as e:
@@ -371,7 +381,10 @@ wave = st.sidebar.number_input("Taille de la vague (≤ 20 conseillé)", 10, 60,
 offset = st.sidebar.number_input("Offset (départ)", 0, 500, 0, 1)
 use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
 
-st.caption(f"Source: Polygon daily ({YEARS} ans) — Stratégie en **Heikin Ashi**, mais Close affiché = réel Polygon — adjusted={ADJUSTED}")
+st.caption(
+    f"Source: Polygon daily ({YEARS} ans) — Stratégie en **Heikin Ashi**, "
+    f"mais Close affiché = réel Polygon — adjusted={ADJUSTED}"
+)
 
 # Filtrage tickers
 if use_dow:
@@ -402,7 +415,7 @@ if not go:
     st.stop()
 
 tickers_tuple = tuple(sorted(set(wave_list)))
-as_of = dt.date.today().isoformat()  # 👈 clé de date pour le cache
+as_of = dt.date.today().isoformat()  # clé de date pour le cache
 
 with st.spinner("Téléchargement des chandelles (Polygon)…"):
     bars, failed = download_bars_polygon_safe(
@@ -414,7 +427,10 @@ with st.spinner("Téléchargement des chandelles (Polygon)…"):
 valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
 st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
 if failed:
-    st.warning(f"⚠️ Tickers échoués (après retries): {len(failed)} — ex.: {', '.join(failed[:8])}{'…' if len(failed)>8 else ''}")
+    st.warning(
+        f"⚠️ Tickers échoués (après retries): {len(failed)} — ex.: "
+        f"{', '.join(failed[:8])}{'…' if len(failed)>8 else ''}"
+    )
 
 if valid == 0:
     st.error("Aucune donnée renvoyée par Polygon pour cette vague.")
@@ -433,22 +449,27 @@ for t in tickers_tuple:
         continue
 
     # dft = OHLCV RÉELS ; la stratégie convertit en HA en interne
-    buy_now, sell_now, last = coach_swing_signals(dft, mode=mode, use_rsi50=use_rsi50)
+    buy_now, sell_now, last, buy_new, sell_new = coach_swing_signals(
+        dft, mode=mode, use_rsi50=use_rsi50
+    )
 
     results.append({
-        "Ticker": t,
-        "Company": base.loc[base["Symbol"] == t, "Company"].values[0]
+        "Ticker":   t,
+        "Company":  base.loc[base["Symbol"] == t, "Company"].values[0]
             if "Company" in base.columns and not base.empty and (base["Symbol"] == t).any()
             else t,
-        "Sector":  base.loc[base["Symbol"] == t, "Sector"].values[0]
+        "Sector":   base.loc[base["Symbol"] == t, "Sector"].values[0]
             if "Sector" in base.columns and not base.empty and (base["Symbol"] == t).any()
             else None,
-        "Buy":     buy_now,
-        "Sell":    sell_now,
-        "Close":   _safe_get(dft["Close"]),  # 👈 VRAI CLOSE POLYGON
-        "RSI":     last.get("RSI"),
-        "WR":      last.get("WR"),
-        "VO":      last.get("VO"),
+        "LastDate": dft.index[-1].date(),
+        "Buy":      buy_now,
+        "Sell":     sell_now,
+        "BuyNew":   buy_new,
+        "SellNew":  sell_new,
+        "Close":    _safe_get(dft["Close"]),  # Close réel Polygon
+        "RSI":      last.get("RSI"),
+        "WR":       last.get("WR"),
+        "VO":       last.get("VO"),
     })
 
 res_df = pd.DataFrame(results)
@@ -461,9 +482,16 @@ if res_df.empty:
 # ==============================
 colA, colB, colC = st.columns([1, 1, 2])
 with colA:
-    show = st.selectbox("Afficher", ["Tous", "Buy seulement", "Sell seulement"], index=0)
+    show = st.selectbox(
+        "Afficher",
+        ["Tous", "Buy seulement", "Sell seulement", "Buy nouveaux seulement"],
+        index=0
+    )
 with colB:
-    sort_by = st.selectbox("Trier par", ["Buy", "Sell", "Close", "Ticker", "Sector"])
+    sort_by = st.selectbox(
+        "Trier par",
+        ["Buy", "Sell", "BuyNew", "SellNew", "Close", "Ticker", "Sector", "LastDate"]
+    )
 with colC:
     ascending = st.checkbox("Tri ascendant", value=False)
 
@@ -471,6 +499,8 @@ if show == "Buy seulement":
     res_view = res_df[res_df["Buy"]]
 elif show == "Sell seulement":
     res_view = res_df[res_df["Sell"]]
+elif show == "Buy nouveaux seulement":
+    res_view = res_df[res_df["BuyNew"]]
 else:
     res_view = res_df
 
@@ -489,5 +519,6 @@ st.markdown("""
 **Notes Polygon :**
 - Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` donnent les vraies barres EOD (ajustées si `adjusted=true`).
 - `Close` affiché dans le tableau = **close réel Polygon**, pas Heikin Ashi.
-- La logique Ichimoku/WR/VO, elle, tourne sur des bougies Heikin Ashi calculées à partir des OHLC réels.
+- La logique Ichimoku/WR/VO tourne sur des bougies Heikin Ashi calculées à partir des OHLC réels.
+- `BuyNew = True` signifie **nouveau signal apparu sur la dernière bougie** (hier → False, aujourd’hui → True).
 """)
