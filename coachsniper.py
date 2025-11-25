@@ -1,4 +1,4 @@
-import os, time, random, datetime as dt, requests 
+import os, time, random, datetime as dt, requests
 from typing import Dict, Tuple, List, Optional
 
 import streamlit as st
@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 # ==============================
-# Config Streamlit (doit être le 1er st.*)
+# Config Streamlit
 # ==============================
 st.set_page_config(
     page_title="Coach Sniper – S&P500",
@@ -45,6 +45,7 @@ DEFAULT_WAVE     = 20
 # Heikin Ashi
 # ==============================
 def to_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """Transforme un OHLCV classique en Heikin Ashi, en conservant l'index."""
     df = df.copy()
     ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
     ha_open = pd.Series(index=df.index, dtype=float)
@@ -91,7 +92,8 @@ def ema(series: pd.Series, length: int) -> pd.Series:
 
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     d = close.diff()
-    gain = d.clip(lower=0.0); loss = -d.clip(upper=0.0)
+    gain = d.clip(lower=0.0)
+    loss = -d.clip(upper=0.0)
     avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
     avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
@@ -125,20 +127,22 @@ def williams_r(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 
     return wr.replace([np.inf, -np.inf], np.nan).fillna(method="bfill").fillna(method="ffill")
 
 def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
-    ema_f = ema(volume, fast); ema_s = ema(volume, slow)
+    ema_f = ema(volume, fast)
+    ema_s = ema(volume, slow)
     with np.errstate(divide="ignore", invalid="ignore"):
         vo = (ema_f - ema_s) / ema_s * 100.0
     return pd.Series(np.where(np.isfinite(vo), vo, 0.0), index=volume.index).fillna(0)
 
 # ==============================
-# Stratégie Ichimoku
+# Stratégie Ichimoku (travaille en HA, mais sur OHLC réels)
 # ==============================
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
     if df is None or df.empty:
         return False, False, {}
-    
-    # 🔧 MODIF : on utilise TOUT le df (on ne coupe plus la dernière bougie)
-    data = df.copy()
+
+    # 🔥 Ici on convertit en Heikin Ashi pour la logique,
+    # mais df lui-même contient les vrais OHLC Polygon.
+    data = to_heikin_ashi(df)
 
     if len(data) < 82:
         return False, False, {}
@@ -193,7 +197,11 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
 
     buy_now, sell_now = bool(buyCond.iloc[-1]), bool(sellCond.iloc[-1])
 
-    ema9 = ema(c, 9); ema20 = ema(c, 20); ema50 = ema(c, 50); ema200 = ema(c, 200)
+    ema9  = ema(c, 9)
+    ema20 = ema(c, 20)
+    ema50 = ema(c, 50)
+    ema200= ema(c, 200)
+
     last = {
         "ema9":   float(ema9.iloc[-1])   if len(ema9)   else None,
         "ema20":  float(ema20.iloc[-1])  if len(ema20)  else None,
@@ -209,6 +217,7 @@ def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: boo
 # Polygon – téléchargement OHLCV daily
 # ==============================
 def _polygon_aggs_daily(ticker: str, debug: bool = False) -> Optional[pd.DataFrame]:
+    """Télécharge les VRAIS OHLCV Polygon (non transformés HA)."""
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=int(YEARS * 365.25))
 
@@ -254,8 +263,8 @@ def _polygon_aggs_daily(ticker: str, debug: bool = False) -> Optional[pd.DataFra
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
             df = df.set_index("ts").sort_index()
             keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            out = df[keep].astype(float)
-            return to_heikin_ashi(out)
+            out = df[keep].astype(float)   # 👈 OHLCV RÉELS
+            return out
 
         except Exception as e:
             last_error = f"Exception: {e}"
@@ -276,9 +285,15 @@ def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame],
         else:
             retry_group.append(t)
 
-# 🔧 MODIF : ajout d’un ttl pour éviter d’utiliser les mêmes données plusieurs jours de suite
-@st.cache_data(show_spinner=False, ttl=60*60)  # cache 1h
-def download_bars_polygon_safe(tickers: tuple[str, ...], debug: bool) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+# ==============================
+# Téléchargement avec cache (clé = tickers + date)
+# ==============================
+@st.cache_data(show_spinner=False, ttl=60*60, max_entries=32)
+def download_bars_polygon_safe(
+    tickers: tuple[str, ...],
+    debug: bool,
+    as_of: str,   # ex: "2025-11-24" → force un refresh chaque jour
+) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     out: Dict[str, pd.DataFrame] = {}
     failed: List[str] = []
     retry_group: List[str] = []
@@ -321,8 +336,10 @@ def download_bars_polygon_safe(tickers: tuple[str, ...], debug: bool) -> Tuple[D
 with st.spinner("Chargement de la liste S&P 500…"):
     sp_df, all_poly_tickers = get_sp500_constituents()
 
-DOW30 = ["AAPL","MSFT","JPM","UNH","GS","HD","MS","AMGN","CRM","MCD","CAT","HON","TRV","CVX",
-         "PG","V","JNJ","BA","DIS","NKE","WMT","AXP","KO","IBM","MRK","CSCO","INTC","VZ","MMM","WBA"]
+DOW30 = [
+    "AAPL","MSFT","JPM","UNH","GS","HD","MS","AMGN","CRM","MCD","CAT","HON","TRV","CVX",
+    "PG","V","JNJ","BA","DIS","NKE","WMT","AXP","KO","IBM","MRK","CSCO","INTC","VZ","MMM","WBA"
+]
 
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
@@ -354,7 +371,7 @@ wave = st.sidebar.number_input("Taille de la vague (≤ 20 conseillé)", 10, 60,
 offset = st.sidebar.number_input("Offset (départ)", 0, 500, 0, 1)
 use_dow = st.sidebar.checkbox("Dow 30 (test rapide)", value=False)
 
-st.caption(f"Source: Polygon daily ({YEARS} ans) — Données converties en **Heikin Ashi** — adjusted={ADJUSTED}")
+st.caption(f"Source: Polygon daily ({YEARS} ans) — Stratégie en **Heikin Ashi**, mais Close affiché = réel Polygon — adjusted={ADJUSTED}")
 
 # Filtrage tickers
 if use_dow:
@@ -385,8 +402,14 @@ if not go:
     st.stop()
 
 tickers_tuple = tuple(sorted(set(wave_list)))
+as_of = dt.date.today().isoformat()  # 👈 clé de date pour le cache
+
 with st.spinner("Téléchargement des chandelles (Polygon)…"):
-    bars, failed = download_bars_polygon_safe(tickers_tuple, debug=debug_polygon)
+    bars, failed = download_bars_polygon_safe(
+        tickers_tuple,
+        debug=debug_polygon,
+        as_of=as_of,
+    )
 
 valid = sum(1 for t in tickers_tuple if bars.get(t) is not None and len(bars[t]) > 0)
 st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
@@ -408,7 +431,10 @@ for t in tickers_tuple:
     dft = bars.get(t)
     if dft is None or len(dft) < 82:
         continue
+
+    # dft = OHLCV RÉELS ; la stratégie convertit en HA en interne
     buy_now, sell_now, last = coach_swing_signals(dft, mode=mode, use_rsi50=use_rsi50)
+
     results.append({
         "Ticker": t,
         "Company": base.loc[base["Symbol"] == t, "Company"].values[0]
@@ -419,7 +445,7 @@ for t in tickers_tuple:
             else None,
         "Buy":     buy_now,
         "Sell":    sell_now,
-        "Close":   _safe_get(dft["Close"]),
+        "Close":   _safe_get(dft["Close"]),  # 👈 VRAI CLOSE POLYGON
         "RSI":     last.get("RSI"),
         "WR":      last.get("WR"),
         "VO":      last.get("VO"),
@@ -461,7 +487,7 @@ st.download_button(
 
 st.markdown("""
 **Notes Polygon :**
-- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` peuvent être **15 min delayed** selon ton plan — suffisant pour du daily.
-- `BRK.B`, `BF.B`, etc. utilisent **le point** chez Polygon (contrairement à Yahoo qui remplace par un tiret).
-- Tu peux aussi placer un fichier CSV local `sp500_constituents.csv` dans le repo avec une colonne de tickers si besoin.
+- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` donnent les vraies barres EOD (ajustées si `adjusted=true`).
+- `Close` affiché dans le tableau = **close réel Polygon**, pas Heikin Ashi.
+- La logique Ichimoku/WR/VO, elle, tourne sur des bougies Heikin Ashi calculées à partir des OHLC réels.
 """)
