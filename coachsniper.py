@@ -1,4 +1,4 @@
-import os, time, random, datetime as dt, requests
+import os, time, random, datetime as dt, requests 
 from typing import Dict, Tuple, List, Optional
 
 import streamlit as st
@@ -136,7 +136,10 @@ def volume_oscillator(volume: pd.Series, fast=5, slow=20) -> pd.Series:
 def coach_swing_signals(df: pd.DataFrame, mode: str = "Balanced", use_rsi50: bool = True):
     if df is None or df.empty:
         return False, False, {}
-    data = df.iloc[:-1] if len(df) > 1 else df.copy()
+    
+    # 🔧 MODIF : on utilise TOUT le df (on ne coupe plus la dernière bougie)
+    data = df.copy()
+
     if len(data) < 82:
         return False, False, {}
 
@@ -273,7 +276,8 @@ def _process_polygon_batch(batch: List[str], out_dict: Dict[str, pd.DataFrame],
         else:
             retry_group.append(t)
 
-@st.cache_data(show_spinner=False)
+# 🔧 MODIF : ajout d’un ttl pour éviter d’utiliser les mêmes données plusieurs jours de suite
+@st.cache_data(show_spinner=False, ttl=60*60)  # cache 1h
 def download_bars_polygon_safe(tickers: tuple[str, ...], debug: bool) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     out: Dict[str, pd.DataFrame] = {}
     failed: List[str] = []
@@ -457,7 +461,7 @@ st.download_button(
 
 st.markdown("""
 **Notes Polygon :**
-- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` sont **15 min delayed** sur ton plan — suffisant pour du daily.
+- Les quotidiens via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}` peuvent être **15 min delayed** selon ton plan — suffisant pour du daily.
 - `BRK.B`, `BF.B`, etc. utilisent **le point** chez Polygon (contrairement à Yahoo qui remplace par un tiret).
 - Tu peux aussi placer un fichier CSV local `sp500_constituents.csv` dans le repo avec une colonne de tickers si besoin.
 """)
